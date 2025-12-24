@@ -193,7 +193,56 @@ def cosine_similarity(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
-def process_chunks(args, classifier, torchaudio, torch, db):
+class SileroVAD:
+    """Silero Voice Activity Detection wrapper."""
+    
+    def __init__(self, torch, threshold=0.5):
+        self.torch = torch
+        self.threshold = threshold
+        self.model, self.utils = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad',
+            model='silero_vad',
+            force_reload=False,
+            trust_repo=True
+        )
+        self.get_speech_timestamps = self.utils[0]
+    
+    def has_speech(self, waveform, sample_rate=16000):
+        """Check if waveform contains speech above threshold."""
+        # Ensure correct shape (1D tensor)
+        if waveform.dim() == 2:
+            waveform = waveform.squeeze(0)
+        
+        # Get speech timestamps
+        speech_timestamps = self.get_speech_timestamps(
+            waveform,
+            self.model,
+            sampling_rate=sample_rate,
+            threshold=self.threshold
+        )
+        
+        return len(speech_timestamps) > 0
+    
+    def get_speech_ratio(self, waveform, sample_rate=16000):
+        """Get ratio of speech to total audio duration."""
+        if waveform.dim() == 2:
+            waveform = waveform.squeeze(0)
+        
+        speech_timestamps = self.get_speech_timestamps(
+            waveform,
+            self.model,
+            sampling_rate=sample_rate,
+            threshold=self.threshold
+        )
+        
+        if not speech_timestamps:
+            return 0.0
+        
+        total_speech = sum(ts['end'] - ts['start'] for ts in speech_timestamps)
+        return total_speech / len(waveform)
+
+
+def process_chunks(args, classifier, torchaudio, torch, db, vad=None):
     """Process audio in chunks and emit speaker change events."""
     temp_wav = None
     try:
@@ -239,12 +288,30 @@ def process_chunks(args, classifier, torchaudio, torch, db):
             if chunk.shape[1] < sample_rate * 0.5:  # min 0.5 seconds
                 break
             
+            current_time = position / sample_rate
+            
+            # VAD check - skip non-speech chunks
+            if vad is not None and not vad.has_speech(chunk, sample_rate):
+                # No speech detected - treat as silence
+                if prev_speaker is not None:
+                    # Emit previous segment before silence
+                    if segment_start < current_time:
+                        event = {
+                            "event": "segment",
+                            "start": round(segment_start, 2),
+                            "end": round(current_time, 2),
+                            "speaker": prev_speaker
+                        }
+                        print(json.dumps(event))
+                    prev_speaker = None
+                    segment_start = current_time
+                position += hop_samples
+                continue
+            
             # Extract embedding for this chunk
             with torch.no_grad():
                 embedding = classifier.encode_batch(chunk)
                 embedding = embedding.squeeze().cpu().numpy()
-            
-            current_time = position / sample_rate
             
             # Query database for speaker
             if len(db) > 0:
@@ -440,7 +507,17 @@ def run_server(host, port, db_path, device="cpu"):
     db = VectorDB(db_path)
     print(f"Loaded {len(db)} speakers from database", file=sys.stderr)
     
-    def stream_diarization(audio_bytes, chunk_size, chunk_hop, threshold, change_threshold, filter_unknown):
+    # VAD will be loaded on first use if requested
+    vad_instance = None
+    
+    def get_vad(vad_threshold):
+        nonlocal vad_instance
+        if vad_instance is None:
+            print("Loading Silero VAD...", file=sys.stderr)
+            vad_instance = SileroVAD(torch, threshold=vad_threshold)
+        return vad_instance
+    
+    def stream_diarization(audio_bytes, chunk_size, chunk_hop, threshold, change_threshold, filter_unknown, use_vad=False, vad_threshold=0.5):
         """Generator that yields diarization events as NDJSON."""
         temp_input = None
         temp_wav = None
@@ -475,7 +552,10 @@ def run_server(host, port, db_path, device="cpu"):
             duration = total_samples / sample_rate
             
             # Emit metadata first
-            yield json.dumps({"event": "start", "duration": round(duration, 2), "speakers": db.list_names()}) + "\n"
+            yield json.dumps({"event": "start", "duration": round(duration, 2), "speakers": db.list_names(), "vad": use_vad}) + "\n"
+            
+            # Get VAD if enabled
+            vad = get_vad(vad_threshold) if use_vad else None
             
             prev_embedding = None
             prev_speaker = None
@@ -489,11 +569,30 @@ def run_server(host, port, db_path, device="cpu"):
                 if chunk.shape[1] < sample_rate * 0.5:
                     break
                 
+                current_time = position / sample_rate
+                
+                # VAD check - skip non-speech chunks
+                if vad is not None and not vad.has_speech(chunk, sample_rate):
+                    # No speech detected
+                    if prev_speaker is not None:
+                        # Emit previous segment before silence
+                        if segment_start < current_time:
+                            if not filter_unknown or prev_speaker is not None:
+                                yield json.dumps({
+                                    "event": "segment",
+                                    "start": round(segment_start, 2),
+                                    "end": round(current_time, 2),
+                                    "speaker": prev_speaker
+                                }) + "\n"
+                        prev_speaker = None
+                        prev_embedding = None
+                        segment_start = current_time
+                    position += hop_samples
+                    continue
+                
                 with torch.no_grad():
                     embedding = classifier.encode_batch(chunk)
                     embedding = embedding.squeeze().cpu().numpy()
-                
-                current_time = position / sample_rate
                 
                 if len(db) > 0:
                     results = db.query(embedding, top_k=1)
@@ -569,13 +668,16 @@ def run_server(host, port, db_path, device="cpu"):
         change_threshold = float(request.form.get("change_threshold", 0.7))
         filter_unknown = request.form.get("filter_unknown", "false").lower() == "true"
         stream = request.form.get("stream", "false").lower() == "true"
+        # VAD enabled by default for diarization, use vad=false to disable
+        use_vad = request.form.get("vad", "true").lower() != "false"
+        vad_threshold = float(request.form.get("vad_threshold", 0.5))
         
         try:
             if response_format == "diarized_json":
                 if stream:
                     # Streaming response - NDJSON with buffering disabled
                     response = Response(
-                        stream_diarization(audio_bytes, chunk_size, chunk_hop, threshold, change_threshold, filter_unknown),
+                        stream_diarization(audio_bytes, chunk_size, chunk_hop, threshold, change_threshold, filter_unknown, use_vad=use_vad, vad_threshold=vad_threshold),
                         mimetype='application/x-ndjson'
                     )
                     response.headers['X-Accel-Buffering'] = 'no'
@@ -792,6 +894,17 @@ def main():
         help="Use GPU acceleration (CUDA or MPS/Metal on Mac)"
     )
     parser.add_argument(
+        "--no-vad",
+        action="store_true",
+        help="Disable Voice Activity Detection (VAD is enabled by default)"
+    )
+    parser.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=0.5,
+        help="VAD speech probability threshold (default: 0.5)"
+    )
+    parser.add_argument(
         "--serve",
         action="store_true",
         help="Run as HTTP server daemon"
@@ -882,9 +995,15 @@ def main():
         print("Model downloaded successfully!", file=sys.stderr)
         return
 
+    # Initialize VAD (enabled by default for diarization)
+    vad = None
+    if args.diarize and not args.no_vad:
+        print("Loading Silero VAD...", file=sys.stderr)
+        vad = SileroVAD(torch, threshold=args.vad_threshold)
+
     # Handle --diarize mode
     if args.diarize:
-        process_chunks(args, classifier, torchaudio, torch, db)
+        process_chunks(args, classifier, torchaudio, torch, db, vad=vad)
         return
 
     # Get embedding from audio

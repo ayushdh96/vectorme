@@ -98,13 +98,29 @@ Output (NDJSON - one JSON object per line):
 {"event": "segment", "start": 4.5, "end": 8.0, "speaker": "Ayush"}
 ```
 
+**Voice Activity Detection (VAD):**
+
+VAD is enabled by default to filter out non-speech segments (silence, music, noise). This improves speaker identification accuracy by only processing chunks with detected speech.
+
+```bash
+# Default behavior - VAD enabled
+vectorme --file audio.m4a --diarize
+
+# Disable VAD
+vectorme --file audio.m4a --diarize --no-vad
+
+# Adjust VAD sensitivity (default: 0.5, range 0.0-1.0)
+vectorme --file audio.m4a --diarize --vad-threshold 0.3
+```
+
 **Tuning parameters:**
 ```bash
 vectorme --file audio.m4a --diarize \
   --chunk-size 2.0 \      # Chunk duration in seconds (default: 2.0)
   --chunk-hop 0.5 \       # Hop between chunks (default: 0.5)
   --threshold 0.5 \       # Minimum similarity to identify speaker (default: 0.5)
-  --change-threshold 0.7  # Threshold for speaker change detection (default: 0.7)
+  --change-threshold 0.7 \# Threshold for speaker change detection (default: 0.7)
+  --vad-threshold 0.5     # VAD speech probability threshold (default: 0.5)
 ```
 
 ### GPU Acceleration
@@ -219,6 +235,8 @@ Real-time NDJSON output:
 - `threshold` - Minimum similarity to identify speaker (default: 0.5)
 - `change_threshold` - Speaker change detection threshold (default: 0.7)
 - `filter_unknown=true` - Hide segments with unknown speakers
+- `vad=false` - Disable Voice Activity Detection (enabled by default)
+- `vad_threshold` - VAD speech probability threshold (default: 0.5)
 
 ## About ECAPA-TDNN
 
