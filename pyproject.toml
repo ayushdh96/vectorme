@@ -28,6 +28,7 @@ dependencies = [
     "torchaudio>=2.0.0",
     "speechbrain>=1.0.0",
     "numpy>=1.21.0",
+    "flask>=2.0.0",
 ]
 
 [project.scripts]

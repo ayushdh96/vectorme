@@ -267,8 +267,8 @@ def process_chunks(args, classifier, torchaudio, torch, db):
                 speaker_changed = True  # First chunk
             
             if speaker_changed:
-                # Emit previous segment if there was one
-                if prev_speaker is not None:
+                # Emit previous segment
+                if segment_start < current_time:
                     event = {
                         "event": "segment",
                         "start": round(segment_start, 2),
@@ -293,8 +293,8 @@ def process_chunks(args, classifier, torchaudio, torch, db):
             position += hop_samples
         
         # Emit final segment
-        if prev_speaker is not None:
-            final_time = total_samples / sample_rate
+        final_time = total_samples / sample_rate
+        if segment_start < final_time:
             event = {
                 "event": "segment",
                 "start": round(segment_start, 2),
@@ -306,6 +306,409 @@ def process_chunks(args, classifier, torchaudio, torch, db):
     finally:
         if temp_wav and os.path.exists(temp_wav):
             os.unlink(temp_wav)
+
+
+def diarize_audio_bytes(audio_bytes, classifier, torchaudio, torch, db,
+                        chunk_size=2.0, chunk_hop=0.5, threshold=0.5, change_threshold=0.7,
+                        filter_unknown=False):
+    """Process audio bytes and return diarization results."""
+    temp_input = None
+    temp_wav = None
+    events = []
+    
+    try:
+        # Write bytes to temp file
+        temp_fd, temp_input = tempfile.mkstemp()
+        os.write(temp_fd, audio_bytes)
+        os.close(temp_fd)
+        
+        # Always convert through ffmpeg since we don't know the format
+        temp_fd2, temp_wav = tempfile.mkstemp(suffix='.wav')
+        os.close(temp_fd2)
+        
+        result = subprocess.run(
+            ['ffmpeg', '-i', temp_input, '-ar', '16000', '-ac', '1', '-y', temp_wav],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg conversion failed: {result.stderr}")
+        
+        waveform, sample_rate = torchaudio.load(temp_wav)
+        
+        # Convert stereo to mono if needed
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+        
+        chunk_samples = int(chunk_size * sample_rate)
+        hop_samples = int(chunk_hop * sample_rate)
+        total_samples = waveform.shape[1]
+        duration = total_samples / sample_rate
+        
+        prev_embedding = None
+        prev_speaker = None
+        segment_start = 0.0
+        
+        position = 0
+        while position < total_samples:
+            end_pos = min(position + chunk_samples, total_samples)
+            chunk = waveform[:, position:end_pos]
+            
+            if chunk.shape[1] < sample_rate * 0.5:
+                break
+            
+            with torch.no_grad():
+                embedding = classifier.encode_batch(chunk)
+                embedding = embedding.squeeze().cpu().numpy()
+            
+            current_time = position / sample_rate
+            
+            if len(db) > 0:
+                results = db.query(embedding, top_k=1)
+                current_speaker = results[0]["name"] if results and results[0]["similarity"] > threshold else None
+                current_similarity = results[0]["similarity"] if results else 0.0
+            else:
+                current_speaker = None
+                current_similarity = 0.0
+            
+            speaker_changed = False
+            if prev_embedding is not None:
+                similarity = cosine_similarity(prev_embedding, embedding)
+                if similarity < change_threshold or current_speaker != prev_speaker:
+                    speaker_changed = True
+            else:
+                speaker_changed = True
+            
+            if speaker_changed:
+                # Emit previous segment
+                if segment_start < current_time:
+                    if not filter_unknown or prev_speaker is not None:
+                        events.append({
+                            "type": "segment",
+                            "start": round(segment_start, 2),
+                            "end": round(current_time, 2),
+                            "speaker": prev_speaker
+                        })
+                segment_start = current_time
+                prev_speaker = current_speaker
+            
+            prev_embedding = embedding
+            position += hop_samples
+        
+        # Final segment
+        if segment_start < duration:
+            if not filter_unknown or prev_speaker is not None:
+                events.append({
+                    "type": "segment",
+                    "start": round(segment_start, 2),
+                    "end": round(duration, 2),
+                "speaker": prev_speaker
+            })
+        
+        return {
+            "duration": round(duration, 2),
+            "segments": events,
+            "speakers": db.list_names()
+        }
+        
+    finally:
+        if temp_input and os.path.exists(temp_input):
+            os.unlink(temp_input)
+        if temp_wav and os.path.exists(temp_wav):
+            os.unlink(temp_wav)
+
+
+def run_server(host, port, db_path, device="cpu"):
+    """Run HTTP server for audio diarization."""
+    from flask import Flask, request, jsonify, Response
+    import torch
+    import torchaudio
+    from speechbrain.inference.speaker import EncoderClassifier
+    
+    app = Flask(__name__)
+    
+    # Load model once at startup
+    print(f"Loading ECAPA-TDNN model on {device}...", file=sys.stderr)
+    model_dir = "~/.cache/speechbrain/spkrec-ecapa-voxceleb"
+    classifier = EncoderClassifier.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb",
+        savedir=model_dir,
+        run_opts={"device": device}
+    )
+    
+    # Initialize database
+    db = VectorDB(db_path)
+    print(f"Loaded {len(db)} speakers from database", file=sys.stderr)
+    
+    def stream_diarization(audio_bytes, chunk_size, chunk_hop, threshold, change_threshold, filter_unknown):
+        """Generator that yields diarization events as NDJSON."""
+        temp_input = None
+        temp_wav = None
+        
+        try:
+            # Write bytes to temp file
+            temp_fd, temp_input = tempfile.mkstemp()
+            os.write(temp_fd, audio_bytes)
+            os.close(temp_fd)
+            
+            # Convert through ffmpeg
+            temp_fd2, temp_wav = tempfile.mkstemp(suffix='.wav')
+            os.close(temp_fd2)
+            
+            result = subprocess.run(
+                ['ffmpeg', '-i', temp_input, '-ar', '16000', '-ac', '1', '-y', temp_wav],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                yield json.dumps({"error": f"ffmpeg conversion failed: {result.stderr}"}) + "\n"
+                return
+            
+            waveform, sample_rate = torchaudio.load(temp_wav)
+            
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+            chunk_samples = int(chunk_size * sample_rate)
+            hop_samples = int(chunk_hop * sample_rate)
+            total_samples = waveform.shape[1]
+            duration = total_samples / sample_rate
+            
+            # Emit metadata first
+            yield json.dumps({"event": "start", "duration": round(duration, 2), "speakers": db.list_names()}) + "\n"
+            
+            prev_embedding = None
+            prev_speaker = None
+            segment_start = 0.0
+            
+            position = 0
+            while position < total_samples:
+                end_pos = min(position + chunk_samples, total_samples)
+                chunk = waveform[:, position:end_pos]
+                
+                if chunk.shape[1] < sample_rate * 0.5:
+                    break
+                
+                with torch.no_grad():
+                    embedding = classifier.encode_batch(chunk)
+                    embedding = embedding.squeeze().cpu().numpy()
+                
+                current_time = position / sample_rate
+                
+                if len(db) > 0:
+                    results = db.query(embedding, top_k=1)
+                    current_speaker = results[0]["name"] if results and results[0]["similarity"] > threshold else None
+                    current_similarity = results[0]["similarity"] if results else 0.0
+                else:
+                    current_speaker = None
+                    current_similarity = 0.0
+                
+                speaker_changed = False
+                if prev_embedding is not None:
+                    similarity = cosine_similarity(prev_embedding, embedding)
+                    if similarity < change_threshold or current_speaker != prev_speaker:
+                        speaker_changed = True
+                else:
+                    speaker_changed = True
+                
+                if speaker_changed:
+                    # Emit previous segment
+                    if segment_start < current_time:
+                        if not filter_unknown or prev_speaker is not None:
+                            yield json.dumps({
+                                "event": "segment",
+                                "start": round(segment_start, 2),
+                                "end": round(current_time, 2),
+                                "speaker": prev_speaker
+                            }) + "\n"
+                    
+                    segment_start = current_time
+                    prev_speaker = current_speaker
+                    
+                    # Emit speaker change event
+                    yield json.dumps({
+                        "event": "speaker_change",
+                        "time": round(current_time, 2),
+                        "speaker": current_speaker,
+                        "similarity": round(current_similarity, 3)
+                    }) + "\n"
+                
+                prev_embedding = embedding
+                position += hop_samples
+            
+            # Final segment
+            if segment_start < duration:
+                if not filter_unknown or prev_speaker is not None:
+                    yield json.dumps({
+                        "event": "segment",
+                        "start": round(segment_start, 2),
+                        "end": round(duration, 2),
+                        "speaker": prev_speaker
+                    }) + "\n"
+            
+            yield json.dumps({"event": "done"}) + "\n"
+            
+        finally:
+            if temp_input and os.path.exists(temp_input):
+                os.unlink(temp_input)
+            if temp_wav and os.path.exists(temp_wav):
+                os.unlink(temp_wav)
+    
+    @app.route("/v1/audio/transcriptions", methods=["POST"])
+    def transcribe():
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        
+        file = request.files["file"]
+        audio_bytes = file.read()
+        
+        response_format = request.form.get("response_format", "json")
+        chunk_size = float(request.form.get("chunk_size", 2.0))
+        chunk_hop = float(request.form.get("chunk_hop", 0.5))
+        threshold = float(request.form.get("threshold", 0.5))
+        change_threshold = float(request.form.get("change_threshold", 0.7))
+        filter_unknown = request.form.get("filter_unknown", "false").lower() == "true"
+        stream = request.form.get("stream", "false").lower() == "true"
+        
+        try:
+            if response_format == "diarized_json":
+                if stream:
+                    # Streaming response - NDJSON with buffering disabled
+                    response = Response(
+                        stream_diarization(audio_bytes, chunk_size, chunk_hop, threshold, change_threshold, filter_unknown),
+                        mimetype='application/x-ndjson'
+                    )
+                    response.headers['X-Accel-Buffering'] = 'no'
+                    response.headers['Cache-Control'] = 'no-cache'
+                    return response
+                else:
+                    # Batch response
+                    result = diarize_audio_bytes(
+                        audio_bytes, classifier, torchaudio, torch, db,
+                        chunk_size=chunk_size,
+                        chunk_hop=chunk_hop,
+                        threshold=threshold,
+                        change_threshold=change_threshold,
+                        filter_unknown=filter_unknown
+                    )
+                    return jsonify(result)
+            else:
+                # Default: return embedding for whole file
+                temp_fd, temp_path = tempfile.mkstemp()
+                temp_wav = None
+                try:
+                    os.write(temp_fd, audio_bytes)
+                    os.close(temp_fd)
+                    
+                    # Always convert through ffmpeg
+                    temp_fd2, temp_wav = tempfile.mkstemp(suffix='.wav')
+                    os.close(temp_fd2)
+                    
+                    result = subprocess.run(
+                        ['ffmpeg', '-i', temp_path, '-ar', '16000', '-ac', '1', '-y', temp_wav],
+                        capture_output=True,
+                        text=True
+                    )
+                    if result.returncode != 0:
+                        raise RuntimeError(f"ffmpeg conversion failed: {result.stderr}")
+                    
+                    waveform, sample_rate = torchaudio.load(temp_wav)
+                    if waveform.shape[0] > 1:
+                        waveform = torch.mean(waveform, dim=0, keepdim=True)
+                    
+                    with torch.no_grad():
+                        embedding = classifier.encode_batch(waveform)
+                        embedding = embedding.squeeze().cpu().numpy()
+                    
+                    if len(db) > 0:
+                        results = db.query(embedding, top_k=5)
+                        return jsonify({
+                            "matches": results,
+                            "best": results[0] if results else None
+                        })
+                    else:
+                        return jsonify({
+                            "embedding": embedding.tolist(),
+                            "dimensions": len(embedding)
+                        })
+                finally:
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                    if temp_wav and os.path.exists(temp_wav):
+                        os.unlink(temp_wav)
+                        
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/v1/speakers", methods=["GET"])
+    def list_speakers():
+        return jsonify({"speakers": db.list_names(), "count": len(db)})
+    
+    @app.route("/v1/speakers", methods=["POST"])
+    def add_speaker():
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        if "name" not in request.form:
+            return jsonify({"error": "No name provided"}), 400
+        
+        file = request.files["file"]
+        name = request.form["name"]
+        audio_bytes = file.read()
+        
+        temp_path = None
+        temp_wav = None
+        try:
+            temp_fd, temp_path = tempfile.mkstemp()
+            os.write(temp_fd, audio_bytes)
+            os.close(temp_fd)
+            
+            # Always convert through ffmpeg
+            temp_fd2, temp_wav = tempfile.mkstemp(suffix='.wav')
+            os.close(temp_fd2)
+            
+            result = subprocess.run(
+                ['ffmpeg', '-i', temp_path, '-ar', '16000', '-ac', '1', '-y', temp_wav],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg conversion failed: {result.stderr}")
+            
+            waveform, sample_rate = torchaudio.load(temp_wav)
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+            with torch.no_grad():
+                embedding = classifier.encode_batch(waveform)
+                embedding = embedding.squeeze().cpu().numpy()
+            
+            db.add(name, embedding)
+            
+            return jsonify({
+                "message": f"Added '{name}' to database",
+                "count": len(db)
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+            if temp_wav and os.path.exists(temp_wav):
+                os.unlink(temp_wav)
+    
+    @app.route("/v1/speakers/<name>", methods=["DELETE"])
+    def remove_speaker(name):
+        if db.remove(name):
+            return jsonify({"message": f"Removed '{name}'", "count": len(db)})
+        else:
+            return jsonify({"error": f"'{name}' not found"}), 404
+    
+    @app.route("/health", methods=["GET"])
+    def health():
+        return jsonify({"status": "ok", "speakers": len(db)})
+    
+    print(f"Starting server on {host}:{port}", file=sys.stderr)
+    app.run(host=host, port=port, threaded=True)
 
 
 def main():
@@ -388,7 +791,42 @@ def main():
         action="store_true",
         help="Use GPU acceleration (CUDA or MPS/Metal on Mac)"
     )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Run as HTTP server daemon"
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Server host address (default: 127.0.0.1)"
+    )
+    parser.add_argument(
+        "--port", "-p",
+        type=int,
+        default=3120,
+        help="Server port (default: 3120)"
+    )
     args = parser.parse_args()
+
+    # Handle --serve mode first (before loading model)
+    if args.serve:
+        # Determine device
+        import torch
+        if args.gpu:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                print("Warning: No GPU available, falling back to CPU", file=sys.stderr)
+                device = "cpu"
+        else:
+            device = "cpu"
+        
+        run_server(args.host, args.port, args.db, device=device)
+        return
 
     # Initialize database
     db = VectorDB(args.db)
