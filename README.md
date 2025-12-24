@@ -1,6 +1,6 @@
 # vectorme
 
-A simple command-line tool to extract speaker embeddings using ECAPA-TDNN.
+A simple command-line tool to extract speaker embeddings using ECAPA-TDNN, with built-in vector database for speaker identification.
 
 ## Installation
 
@@ -17,17 +17,61 @@ vectorme --download-only
 
 ## Usage
 
-### Pipe audio from stdin:
+### Basic Embedding Extraction
+
+**Pipe audio from stdin:**
 ```bash
 cat audio.wav | vectorme
 ```
 
-### Read from file:
+**Read from file:**
 ```bash
 vectorme --file audio.wav
 ```
 
-### Output formats:
+### Vector Database
+
+vectorme includes a built-in vector database for storing and querying speaker embeddings. The database is stored at `~/.vectorme/speakers.npz` by default.
+
+**Add a speaker to the database:**
+```bash
+vectorme --file audio.wav --name "Doug"
+# Added 'Doug' to database (1 total)
+```
+
+**Query for the closest match:**
+```bash
+cat unknown.wav | vectorme
+# {"matches": [{"name": "Doug", "similarity": 0.95}, ...], "best": {"name": "Doug", "similarity": 0.95}}
+```
+
+**List all speakers in the database:**
+```bash
+vectorme --list
+# Doug
+# Alice
+# Bob
+```
+
+**Remove a speaker from the database:**
+```bash
+vectorme --remove "Doug"
+# Removed 'Doug' from database
+```
+
+**Use a custom database location:**
+```bash
+vectorme --file audio.wav --db /path/to/custom.npz --name "Doug"
+```
+
+**Control number of matches returned:**
+```bash
+cat audio.wav | vectorme --top 3
+```
+
+### Output Formats
+
+When the database is empty, vectorme outputs the raw embedding:
 
 **JSON (default):**
 ```bash
