@@ -17,6 +17,8 @@ import argparse
 import json
 import warnings
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 import numpy as np
 
@@ -118,32 +120,70 @@ class VectorDB:
         return len(self.names)
 
 
+# Audio formats that need ffmpeg conversion
+FFMPEG_FORMATS = {'.m4a', '.mp3', '.aac', '.ogg', '.wma', '.flac', '.opus', '.webm', '.mp4'}
+
+
+def convert_to_wav(input_path):
+    """Convert audio file to 16kHz mono WAV using ffmpeg. Returns temp file path."""
+    suffix = Path(input_path).suffix.lower()
+    if suffix not in FFMPEG_FORMATS:
+        return None  # No conversion needed
+    
+    # Create temp file for WAV output
+    temp_fd, temp_path = tempfile.mkstemp(suffix='.wav')
+    os.close(temp_fd)
+    
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-i', input_path, '-ar', '16000', '-ac', '1', '-y', temp_path],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            os.unlink(temp_path)
+            raise RuntimeError(f"ffmpeg conversion failed: {result.stderr}")
+        return temp_path
+    except FileNotFoundError:
+        os.unlink(temp_path)
+        raise RuntimeError("ffmpeg not found. Install ffmpeg to process m4a/mp3 files.")
+
+
 def get_embedding(args, classifier, torchaudio, torch):
     """Extract embedding from audio file or stdin."""
-    if args.file:
-        waveform, sample_rate = torchaudio.load(args.file)
-    else:
-        if sys.stdin.isatty():
-            return None
-        audio_bytes = sys.stdin.buffer.read()
-        audio_buffer = io.BytesIO(audio_bytes)
-        waveform, sample_rate = torchaudio.load(audio_buffer)
-    
-    # Resample to 16kHz if needed
-    if sample_rate != 16000:
-        resampler = torchaudio.transforms.Resample(sample_rate, 16000)
-        waveform = resampler(waveform)
-    
-    # Convert stereo to mono if needed
-    if waveform.shape[0] > 1:
-        waveform = torch.mean(waveform, dim=0, keepdim=True)
-    
-    # Extract embedding
-    with torch.no_grad():
-        embedding = classifier.encode_batch(waveform)
-        embedding = embedding.squeeze().cpu().numpy()
-    
-    return embedding
+    temp_wav = None
+    try:
+        if args.file:
+            # Check if conversion is needed
+            temp_wav = convert_to_wav(args.file)
+            audio_path = temp_wav if temp_wav else args.file
+            waveform, sample_rate = torchaudio.load(audio_path)
+        else:
+            if sys.stdin.isatty():
+                return None
+            audio_bytes = sys.stdin.buffer.read()
+            audio_buffer = io.BytesIO(audio_bytes)
+            waveform, sample_rate = torchaudio.load(audio_buffer)
+        
+        # Resample to 16kHz if needed
+        if sample_rate != 16000:
+            resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+            waveform = resampler(waveform)
+        
+        # Convert stereo to mono if needed
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+        
+        # Extract embedding
+        with torch.no_grad():
+            embedding = classifier.encode_batch(waveform)
+            embedding = embedding.squeeze().cpu().numpy()
+        
+        return embedding
+    finally:
+        # Clean up temp file
+        if temp_wav and os.path.exists(temp_wav):
+            os.unlink(temp_wav)
 
 
 def main():
