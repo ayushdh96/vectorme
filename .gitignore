@@ -1,0 +1,17 @@
+# Build artifacts
+*.egg-info/
+__pycache__/
+*.pyc
+dist/
+build/
+
+# Audio files (samples)
+*.wav
+*.m4a
+*.mp3
+
+# OS
+.DS_Store
+
+# Model cache (downloaded separately)
+~/.cache/

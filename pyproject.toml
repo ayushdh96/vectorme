@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vectorme"
+version = "0.1.0"
+description = "Extract speaker embeddings using ECAPA-TDNN"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "you@example.com"}
+]
+keywords = ["speaker", "embedding", "ecapa-tdnn", "voice"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+    "speechbrain>=1.0.0",
+    "numpy>=1.21.0",
+]
+
+[project.scripts]
+vectorme = "vectorme:main"
+
+[project.urls]
+Homepage = "https://github.com/yourname/vectorme"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vectorme*"]
