@@ -186,6 +186,128 @@ def get_embedding(args, classifier, torchaudio, torch):
             os.unlink(temp_wav)
 
 
+def cosine_similarity(a, b):
+    """Compute cosine similarity between two vectors."""
+    a = np.array(a).flatten()
+    b = np.array(b).flatten()
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+
+def process_chunks(args, classifier, torchaudio, torch, db):
+    """Process audio in chunks and emit speaker change events."""
+    temp_wav = None
+    try:
+        if args.file:
+            temp_wav = convert_to_wav(args.file)
+            audio_path = temp_wav if temp_wav else args.file
+            waveform, sample_rate = torchaudio.load(audio_path)
+        else:
+            if sys.stdin.isatty():
+                return
+            audio_bytes = sys.stdin.buffer.read()
+            audio_buffer = io.BytesIO(audio_bytes)
+            waveform, sample_rate = torchaudio.load(audio_buffer)
+        
+        # Resample to 16kHz if needed
+        if sample_rate != 16000:
+            resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+            waveform = resampler(waveform)
+            sample_rate = 16000
+        
+        # Convert stereo to mono if needed
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+        
+        # Chunk parameters
+        chunk_duration = args.chunk_size  # seconds
+        chunk_samples = int(chunk_duration * sample_rate)
+        hop_duration = args.chunk_hop  # seconds
+        hop_samples = int(hop_duration * sample_rate)
+        
+        total_samples = waveform.shape[1]
+        
+        prev_embedding = None
+        prev_speaker = None
+        segment_start = 0.0
+        
+        position = 0
+        while position < total_samples:
+            end_pos = min(position + chunk_samples, total_samples)
+            chunk = waveform[:, position:end_pos]
+            
+            # Skip chunks that are too short
+            if chunk.shape[1] < sample_rate * 0.5:  # min 0.5 seconds
+                break
+            
+            # Extract embedding for this chunk
+            with torch.no_grad():
+                embedding = classifier.encode_batch(chunk)
+                embedding = embedding.squeeze().cpu().numpy()
+            
+            current_time = position / sample_rate
+            
+            # Query database for speaker
+            if len(db) > 0:
+                results = db.query(embedding, top_k=1)
+                current_speaker = results[0]["name"] if results and results[0]["similarity"] > args.threshold else None
+                current_similarity = results[0]["similarity"] if results else 0.0
+            else:
+                current_speaker = None
+                current_similarity = 0.0
+            
+            # Check for speaker change
+            speaker_changed = False
+            if prev_embedding is not None:
+                similarity = cosine_similarity(prev_embedding, embedding)
+                # Speaker changed if embedding similarity drops below threshold
+                # or if the identified speaker is different
+                if similarity < args.change_threshold or current_speaker != prev_speaker:
+                    speaker_changed = True
+            else:
+                speaker_changed = True  # First chunk
+            
+            if speaker_changed:
+                # Emit previous segment if there was one
+                if prev_speaker is not None:
+                    event = {
+                        "event": "segment",
+                        "start": round(segment_start, 2),
+                        "end": round(current_time, 2),
+                        "speaker": prev_speaker
+                    }
+                    print(json.dumps(event))
+                
+                segment_start = current_time
+                prev_speaker = current_speaker
+                
+                # Emit speaker change event
+                event = {
+                    "event": "speaker_change",
+                    "time": round(current_time, 2),
+                    "speaker": current_speaker,
+                    "similarity": round(current_similarity, 3)
+                }
+                print(json.dumps(event))
+            
+            prev_embedding = embedding
+            position += hop_samples
+        
+        # Emit final segment
+        if prev_speaker is not None:
+            final_time = total_samples / sample_rate
+            event = {
+                "event": "segment",
+                "start": round(segment_start, 2),
+                "end": round(final_time, 2),
+                "speaker": prev_speaker
+            }
+            print(json.dumps(event))
+        
+    finally:
+        if temp_wav and os.path.exists(temp_wav):
+            os.unlink(temp_wav)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract speaker embedding vector using ECAPA-TDNN"
@@ -232,6 +354,40 @@ def main():
         action="store_true",
         help="Only download the model, don't process audio"
     )
+    parser.add_argument(
+        "--diarize", "-d",
+        action="store_true",
+        help="Process audio in chunks and emit speaker change events"
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=float,
+        default=2.0,
+        help="Chunk duration in seconds for diarization (default: 2.0)"
+    )
+    parser.add_argument(
+        "--chunk-hop",
+        type=float,
+        default=0.5,
+        help="Hop between chunks in seconds (default: 0.5)"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Minimum similarity to identify a speaker (default: 0.5)"
+    )
+    parser.add_argument(
+        "--change-threshold",
+        type=float,
+        default=0.7,
+        help="Similarity threshold below which speaker is considered changed (default: 0.7)"
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Use GPU acceleration (CUDA or MPS/Metal on Mac)"
+    )
     args = parser.parse_args()
 
     # Initialize database
@@ -261,16 +417,36 @@ def main():
     import torchaudio
     from speechbrain.inference.speaker import EncoderClassifier
 
+    # Determine device
+    if args.gpu:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            print("Warning: No GPU available, falling back to CPU", file=sys.stderr)
+            device = "cpu"
+    else:
+        device = "cpu"
+
     # Load the ECAPA-TDNN model (downloads on first use)
     model_dir = "~/.cache/speechbrain/spkrec-ecapa-voxceleb"
     classifier = EncoderClassifier.from_hparams(
         source="speechbrain/spkrec-ecapa-voxceleb",
         savedir=model_dir,
-        run_opts={"device": "cpu"}
+        run_opts={"device": device}
     )
+    
+    if args.gpu and device != "cpu":
+        print(f"Using {device.upper()} acceleration", file=sys.stderr)
 
     if args.download_only:
         print("Model downloaded successfully!", file=sys.stderr)
+        return
+
+    # Handle --diarize mode
+    if args.diarize:
+        process_chunks(args, classifier, torchaudio, torch, db)
         return
 
     # Get embedding from audio
