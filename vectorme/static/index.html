@@ -1190,6 +1190,19 @@
                     setActiveSegment(segment);
                     activeSegmentRef.current = segment;
                     
+                    // Clear existing regions and create a new one for this segment
+                    if (regionsRef.current) {
+                        regionsRef.current.clearRegions();
+                        regionsRef.current.addRegion({
+                            start: segment.start,
+                            end: segment.end,
+                            color: 'rgba(0, 210, 255, 0.3)',
+                        });
+                        const sel = { start: segment.start, end: segment.end };
+                        setSelection(sel);
+                        selectionRef.current = sel;
+                    }
+                    
                     // Seek to the position (0-1 range)
                     const position = segment.start / duration;
                     playbackWavesurferRef.current.seekTo(position);
