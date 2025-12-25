@@ -1527,6 +1527,15 @@
                                         ✕ Clear
                                     </button>
                                 )}
+                                {selection && (
+                                    <button 
+                                        className="btn-play" 
+                                        onClick={(e) => openNamingModal({ start: selection.start, end: selection.end }, e)}
+                                        style={{ background: 'linear-gradient(135deg, #00d2ff, #3a7bd5)' }}
+                                    >
+                                        🏷️ Name Speaker
+                                    </button>
+                                )}
                             </div>
                             
                             {/* Save Recording Form */}
