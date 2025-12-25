@@ -699,6 +699,7 @@
             // Saved recordings state
             const [savedRecordings, setSavedRecordings] = useState([]);
             const [recordingName, setRecordingName] = useState('');
+            const [currentTime, setCurrentTime] = useState(0);
             const [isSavingRecording, setIsSavingRecording] = useState(false);
             const [isLoadingRecording, setIsLoadingRecording] = useState(false);
 
@@ -771,9 +772,10 @@
                         setIsPlaying(false);
                     });
 
-                    // Listen for timeupdate to stop at segment end
-                    playbackWavesurferRef.current.on('timeupdate', (currentTime) => {
-                        if (activeSegmentRef.current && currentTime >= activeSegmentRef.current.end) {
+                    // Listen for timeupdate to track position and stop at segment end
+                    playbackWavesurferRef.current.on('timeupdate', (time) => {
+                        setCurrentTime(time);
+                        if (activeSegmentRef.current && time >= activeSegmentRef.current.end) {
                             playbackWavesurferRef.current.pause();
                             setActiveSegment(null);
                             activeSegmentRef.current = null;
@@ -1091,6 +1093,24 @@
                 }
             }, []);
 
+            // Keyboard shortcut for spacebar to toggle playback
+            useEffect(() => {
+                const handleKeyDown = (e) => {
+                    // Only trigger if not typing in an input field
+                    if (e.code === 'Space' && 
+                        e.target.tagName !== 'INPUT' && 
+                        e.target.tagName !== 'TEXTAREA' &&
+                        playbackWavesurferRef.current &&
+                        audioBlob) {
+                        e.preventDefault();
+                        playbackWavesurferRef.current.playPause();
+                    }
+                };
+                
+                window.addEventListener('keydown', handleKeyDown);
+                return () => window.removeEventListener('keydown', handleKeyDown);
+            }, [audioBlob]);
+
             const seekToSegment = useCallback((segment) => {
                 if (playbackWavesurferRef.current && duration > 0) {
                     // Set active segment for tracking
@@ -1386,6 +1406,19 @@
                         <div className="card">
                             <h3>📼 Recorded Audio</h3>
                             <div className="waveform-container" ref={playbackWaveformRef}></div>
+                            <div className="playback-time" style={{
+                                display: 'flex',
+                                justifyContent: 'space-between',
+                                padding: '4px 8px',
+                                fontFamily: "'Monaco', 'Consolas', monospace",
+                                fontSize: '13px',
+                                color: '#4a9eff',
+                                marginBottom: '8px'
+                            }}>
+                                <span>{formatTime(currentTime)}</span>
+                                <span style={{ color: '#888' }}>Press Space to play/pause</span>
+                                <span>{formatTime(duration)}</span>
+                            </div>
                             <div className="controls">
                                 <button 
                                     className="btn-play" 
