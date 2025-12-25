@@ -56,20 +56,15 @@ class VectorDB:
             np.savez(self.db_path, names=np.array(self.names), embeddings=self.embeddings)
     
     def add(self, name, embedding):
-        """Add or update a speaker embedding."""
+        """Add a speaker embedding (appends if name exists, creating multiple embeddings per speaker)."""
         embedding = np.array(embedding).reshape(1, -1)
         
-        if name in self.names:
-            # Update existing
-            idx = self.names.index(name)
-            self.embeddings[idx] = embedding
+        # Always append - allows multiple embeddings per speaker for better matching
+        self.names.append(name)
+        if self.embeddings is None:
+            self.embeddings = embedding
         else:
-            # Add new
-            self.names.append(name)
-            if self.embeddings is None:
-                self.embeddings = embedding
-            else:
-                self.embeddings = np.vstack([self.embeddings, embedding])
+            self.embeddings = np.vstack([self.embeddings, embedding])
         
         self._save()
     
@@ -113,8 +108,20 @@ class VectorDB:
         return results
     
     def list_names(self):
-        """List all names in the database."""
-        return sorted(self.names)
+        """List all unique names in the database."""
+        return sorted(set(self.names))
+    
+    def count_by_name(self):
+        """Return dict of name -> count of embeddings."""
+        from collections import Counter
+        return dict(Counter(self.names))
+    
+    def get_embeddings_by_name(self, name):
+        """Get all embeddings for a given name."""
+        indices = [i for i, n in enumerate(self.names) if n == name]
+        if not indices or self.embeddings is None:
+            return []
+        return [self.embeddings[i] for i in indices]
     
     def __len__(self):
         return len(self.names)
@@ -295,7 +302,7 @@ def process_chunks(args, classifier, torchaudio, torch, db, vad=None):
                 # No speech detected - treat as silence
                 if prev_speaker is not None:
                     # Emit previous segment before silence
-                    if segment_start < current_time:
+                    if segment_start is not None and segment_start < current_time:
                         event = {
                             "event": "segment",
                             "start": round(segment_start, 2),
@@ -304,9 +311,15 @@ def process_chunks(args, classifier, torchaudio, torch, db, vad=None):
                         }
                         print(json.dumps(event))
                     prev_speaker = None
-                    segment_start = current_time
+                    prev_embedding = None
+                # Mark that we're in silence
+                segment_start = None
                 position += hop_samples
                 continue
+            
+            # If we were in silence and speech resumed, update segment_start
+            if segment_start is None:
+                segment_start = current_time
             
             # Extract embedding for this chunk
             with torch.no_grad():
@@ -335,7 +348,7 @@ def process_chunks(args, classifier, torchaudio, torch, db, vad=None):
             
             if speaker_changed:
                 # Emit previous segment
-                if segment_start < current_time:
+                if segment_start is not None and segment_start < current_time:
                     event = {
                         "event": "segment",
                         "start": round(segment_start, 2),
@@ -361,7 +374,7 @@ def process_chunks(args, classifier, torchaudio, torch, db, vad=None):
         
         # Emit final segment
         final_time = total_samples / sample_rate
-        if segment_start < final_time:
+        if segment_start is not None and segment_start < final_time:
             event = {
                 "event": "segment",
                 "start": round(segment_start, 2),
@@ -590,9 +603,14 @@ def run_server(host, port, db_path, device="cpu"):
                                 }) + "\n"
                         prev_speaker = None
                         prev_embedding = None
-                        segment_start = current_time
+                    # Don't update segment_start here - we'll set it when speech resumes
+                    segment_start = None  # Mark that we're in silence
                     position += hop_samples
                     continue
+                
+                # If we were in silence and speech resumed, update segment_start
+                if segment_start is None:
+                    segment_start = current_time
                 
                 with torch.no_grad():
                     embedding = classifier.encode_batch(chunk)
@@ -616,7 +634,7 @@ def run_server(host, port, db_path, device="cpu"):
                 
                 if speaker_changed:
                     # Emit previous segment
-                    if segment_start < current_time:
+                    if segment_start is not None and segment_start < current_time:
                         if not filter_unknown or prev_speaker is not None:
                             yield json.dumps({
                                 "event": "segment",
@@ -640,7 +658,7 @@ def run_server(host, port, db_path, device="cpu"):
                 position += hop_samples
             
             # Final segment
-            if segment_start < duration:
+            if segment_start is not None and segment_start < duration:
                 if not filter_unknown or prev_speaker is not None:
                     yield json.dumps({
                         "event": "segment",
@@ -809,6 +827,80 @@ def run_server(host, port, db_path, device="cpu"):
         else:
             return jsonify({"error": f"'{name}' not found"}), 404
     
+    @app.route("/v1/speakers/from-segment", methods=["POST"])
+    def add_speaker_from_segment():
+        """Add a speaker from a segment of audio with start/end times."""
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        if "name" not in request.form:
+            return jsonify({"error": "No name provided"}), 400
+        if "start" not in request.form or "end" not in request.form:
+            return jsonify({"error": "start and end times required"}), 400
+        
+        file = request.files["file"]
+        name = request.form["name"]
+        start = float(request.form["start"])
+        end = float(request.form["end"])
+        audio_bytes = file.read()
+        
+        temp_path = None
+        temp_wav = None
+        temp_segment = None
+        try:
+            temp_fd, temp_path = tempfile.mkstemp()
+            os.write(temp_fd, audio_bytes)
+            os.close(temp_fd)
+            
+            # Convert to WAV
+            temp_fd2, temp_wav = tempfile.mkstemp(suffix='.wav')
+            os.close(temp_fd2)
+            
+            result = subprocess.run(
+                ['ffmpeg', '-i', temp_path, '-ar', '16000', '-ac', '1', '-y', temp_wav],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg conversion failed: {result.stderr}")
+            
+            # Extract segment using ffmpeg
+            temp_fd3, temp_segment = tempfile.mkstemp(suffix='.wav')
+            os.close(temp_fd3)
+            
+            duration = end - start
+            result = subprocess.run(
+                ['ffmpeg', '-i', temp_wav, '-ss', str(start), '-t', str(duration), '-y', temp_segment],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg segment extraction failed: {result.stderr}")
+            
+            waveform, sample_rate = torchaudio.load(temp_segment)
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+            with torch.no_grad():
+                embedding = classifier.encode_batch(waveform)
+                embedding = embedding.squeeze().cpu().numpy()
+            
+            db.add(name, embedding)
+            
+            return jsonify({
+                "message": f"Added '{name}' from segment {start:.1f}s-{end:.1f}s",
+                "name": name,
+                "count": len(db)
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+            if temp_wav and os.path.exists(temp_wav):
+                os.unlink(temp_wav)
+            if temp_segment and os.path.exists(temp_segment):
+                os.unlink(temp_segment)
+    
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({"status": "ok", "speakers": len(db)})
@@ -856,6 +948,11 @@ def main():
         "--list", "-l",
         action="store_true",
         help="List all names in the database"
+    )
+    parser.add_argument(
+        "--distance",
+        action="store_true",
+        help="With --list, show cosine distances between embeddings for each speaker"
     )
     parser.add_argument(
         "--remove", "-r",
@@ -954,10 +1051,26 @@ def main():
 
     # Handle --list
     if args.list:
-        names = db.list_names()
-        if names:
-            for name in names:
-                print(name)
+        counts = db.count_by_name()
+        if counts:
+            for name in sorted(counts.keys()):
+                count = counts[name]
+                print(f"{name}: {count} embedding(s)")
+                
+                # Show distances if requested and there are multiple embeddings
+                if args.distance and count > 1:
+                    embeddings = db.get_embeddings_by_name(name)
+                    # Calculate pairwise cosine similarities
+                    for i in range(len(embeddings)):
+                        for j in range(i + 1, len(embeddings)):
+                            e1 = embeddings[i].reshape(1, -1)
+                            e2 = embeddings[j].reshape(1, -1)
+                            norm1 = e1 / np.linalg.norm(e1)
+                            norm2 = e2 / np.linalg.norm(e2)
+                            sim = float(np.dot(norm1, norm2.T))
+                            dist = 1 - sim
+                            print(f"  [{i+1}] <-> [{j+1}]: similarity={sim:.3f}, distance={dist:.3f}")
+            print(f"\nTotal: {len(db)} embeddings, {len(counts)} speakers", file=sys.stderr)
         else:
             print("Database is empty", file=sys.stderr)
         return
