@@ -487,12 +487,16 @@ def diarize_audio_bytes(audio_bytes, classifier, torchaudio, torch, db,
 
 def run_server(host, port, db_path, device="cpu"):
     """Run HTTP server for audio diarization."""
-    from flask import Flask, request, jsonify, Response
+    from flask import Flask, request, jsonify, Response, send_from_directory
     import torch
     import torchaudio
     from speechbrain.inference.speaker import EncoderClassifier
     
-    app = Flask(__name__)
+    # Get the directory where this file is located
+    import os.path as osp
+    static_folder = osp.join(osp.dirname(osp.abspath(__file__)), 'static')
+    
+    app = Flask(__name__, static_folder=static_folder)
     
     # Load model once at startup
     print(f"Loading ECAPA-TDNN model on {device}...", file=sys.stderr)
@@ -808,6 +812,10 @@ def run_server(host, port, db_path, device="cpu"):
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({"status": "ok", "speakers": len(db)})
+    
+    @app.route("/", methods=["GET"])
+    def index():
+        return send_from_directory(static_folder, "index.html")
     
     print(f"Starting server on {host}:{port}", file=sys.stderr)
     app.run(host=host, port=port, threaded=True)

@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VectorMe - Voice Recording & Speaker Diarization</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/wavesurfer.js@7"></script>
+    <script src="https://unpkg.com/wavesurfer.js@7/dist/plugins/record.esm.js" type="module"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .waveform-container {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            min-height: 128px;
+        }
+        .controls {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .btn-record {
+            background: linear-gradient(135deg, #ff416c, #ff4b2b);
+            color: white;
+        }
+        .btn-record:hover:not(:disabled) {
+            transform: scale(1.05);
+            box-shadow: 0 4px 20px rgba(255, 65, 108, 0.4);
+        }
+        .btn-record.recording {
+            animation: pulse 1.5s infinite;
+        }
+        .btn-stop {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+        }
+        .btn-stop:hover:not(:disabled) {
+            transform: scale(1.05);
+            box-shadow: 0 4px 20px rgba(102, 126, 234, 0.4);
+        }
+        .btn-play {
+            background: linear-gradient(135deg, #11998e, #38ef7d);
+            color: white;
+        }
+        .btn-play:hover:not(:disabled) {
+            transform: scale(1.05);
+            box-shadow: 0 4px 20px rgba(56, 239, 125, 0.4);
+        }
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(255, 65, 108, 0.7); }
+            50% { box-shadow: 0 0 0 15px rgba(255, 65, 108, 0); }
+        }
+        .status {
+            text-align: center;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-weight: 500;
+        }
+        .status.recording {
+            background: rgba(255, 65, 108, 0.2);
+            color: #ff6b8a;
+        }
+        .status.processing {
+            background: rgba(102, 126, 234, 0.2);
+            color: #a0b0ff;
+        }
+        .status.ready {
+            background: rgba(56, 239, 125, 0.2);
+            color: #6bffb3;
+        }
+        .diarization-results {
+            margin-top: 20px;
+        }
+        .diarization-results h3 {
+            margin-bottom: 16px;
+            color: #a0b0ff;
+        }
+        .segment {
+            display: flex;
+            align-items: center;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            margin-bottom: 8px;
+            transition: all 0.2s ease;
+        }
+        .segment:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+        .segment-time {
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 14px;
+            color: #888;
+            min-width: 120px;
+        }
+        .segment-speaker {
+            flex: 1;
+            font-weight: 600;
+            padding: 4px 12px;
+            border-radius: 4px;
+            display: inline-block;
+        }
+        .segment-speaker.unknown {
+            background: rgba(255, 255, 255, 0.1);
+            color: #999;
+        }
+        .segment-speaker.known {
+            background: linear-gradient(135deg, #00d2ff, #3a7bd5);
+            color: white;
+        }
+        .segment-similarity {
+            font-size: 14px;
+            color: #666;
+            margin-left: 12px;
+        }
+        .timeline {
+            position: relative;
+            height: 40px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 8px;
+            margin-top: 20px;
+            overflow: hidden;
+        }
+        .timeline-segment {
+            position: absolute;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: 600;
+            color: white;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+            overflow: hidden;
+            white-space: nowrap;
+        }
+        .speaker-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 20px;
+        }
+        .speaker-badge {
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 14px;
+            background: rgba(255, 255, 255, 0.1);
+        }
+        .live-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .live-dot {
+            width: 8px;
+            height: 8px;
+            background: #ff4b2b;
+            border-radius: 50%;
+            animation: blink 1s infinite;
+        }
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        .events-log {
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 12px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 8px;
+            padding: 12px;
+        }
+        .event-item {
+            padding: 4px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .event-item:last-child {
+            border-bottom: none;
+        }
+        .event-type {
+            color: #00d2ff;
+        }
+        .segment-play-icon {
+            color: #4a9eff;
+            font-size: 12px;
+            margin-left: auto;
+            opacity: 0.5;
+            transition: opacity 0.2s ease;
+        }
+        .segment:hover .segment-play-icon {
+            opacity: 1;
+        }
+        .segment.active {
+            background: rgba(74, 158, 255, 0.2);
+            border: 1px solid rgba(74, 158, 255, 0.5);
+        }
+        .timeline-segment.active {
+            box-shadow: 0 0 0 2px #fff, 0 0 10px rgba(74, 158, 255, 0.8);
+            z-index: 10;
+        }
+        .timeline-info {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 8px;
+            padding: 8px 12px;
+            background: rgba(74, 158, 255, 0.1);
+            border-radius: 6px;
+            font-size: 13px;
+        }
+        .timeline-info-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .timeline-info-label {
+            color: #888;
+        }
+        .timeline-info-value {
+            color: #4a9eff;
+            font-weight: 600;
+            font-family: 'Monaco', 'Consolas', monospace;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        // Speaker colors for timeline
+        const SPEAKER_COLORS = [
+            '#ff416c', '#667eea', '#11998e', '#f7971e', '#8e44ad',
+            '#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6'
+        ];
+
+        function getSpeakerColor(speaker, speakerMap) {
+            if (!speaker) return 'rgba(128, 128, 128, 0.5)';
+            if (!speakerMap.has(speaker)) {
+                speakerMap.set(speaker, SPEAKER_COLORS[speakerMap.size % SPEAKER_COLORS.length]);
+            }
+            return speakerMap.get(speaker);
+        }
+
+        function formatTime(seconds) {
+            const mins = Math.floor(seconds / 60);
+            const secs = (seconds % 60).toFixed(1);
+            return `${mins}:${secs.padStart(4, '0')}`;
+        }
+
+        function VoiceRecorder() {
+            const [isRecording, setIsRecording] = useState(false);
+            const [isPlaying, setIsPlaying] = useState(false);
+            const [status, setStatus] = useState('ready');
+            const [statusText, setStatusText] = useState('Ready to record');
+            const [audioBlob, setAudioBlob] = useState(null);
+            const [duration, setDuration] = useState(0);
+            const [segments, setSegments] = useState([]);
+            const [events, setEvents] = useState([]);
+            const [speakers, setSpeakers] = useState([]);
+            const [speakerMap] = useState(new Map());
+            const [activeSegment, setActiveSegment] = useState(null);
+
+            const waveformRef = useRef(null);
+            const playbackWaveformRef = useRef(null);
+            const wavesurferRef = useRef(null);
+            const playbackWavesurferRef = useRef(null);
+            const mediaRecorderRef = useRef(null);
+            const audioChunksRef = useRef([]);
+            const streamRef = useRef(null);
+            const processingRef = useRef(false);
+            const lastProcessedChunkRef = useRef(0);
+            const activeSegmentRef = useRef(null);
+
+            // Initialize recording waveform
+            useEffect(() => {
+                if (waveformRef.current && !wavesurferRef.current) {
+                    wavesurferRef.current = WaveSurfer.create({
+                        container: waveformRef.current,
+                        waveColor: '#4a9eff',
+                        progressColor: '#00d2ff',
+                        cursorColor: '#fff',
+                        barWidth: 2,
+                        barGap: 1,
+                        barRadius: 2,
+                        height: 80,
+                        normalize: true,
+                    });
+                }
+
+                return () => {
+                    if (wavesurferRef.current) {
+                        wavesurferRef.current.destroy();
+                        wavesurferRef.current = null;
+                    }
+                };
+            }, []);
+
+            // Initialize playback waveform when audio is available
+            useEffect(() => {
+                if (playbackWaveformRef.current && audioBlob && !playbackWavesurferRef.current) {
+                    playbackWavesurferRef.current = WaveSurfer.create({
+                        container: playbackWaveformRef.current,
+                        waveColor: '#4a9eff',
+                        progressColor: '#00d2ff',
+                        cursorColor: '#fff',
+                        barWidth: 2,
+                        barGap: 1,
+                        barRadius: 2,
+                        height: 80,
+                        normalize: true,
+                    });
+
+                    const url = URL.createObjectURL(audioBlob);
+                    playbackWavesurferRef.current.load(url);
+
+                    playbackWavesurferRef.current.on('finish', () => {
+                        setIsPlaying(false);
+                    });
+
+                    playbackWavesurferRef.current.on('play', () => {
+                        setIsPlaying(true);
+                    });
+
+                    playbackWavesurferRef.current.on('pause', () => {
+                        setIsPlaying(false);
+                    });
+
+                    // Listen for timeupdate to stop at segment end
+                    playbackWavesurferRef.current.on('timeupdate', (currentTime) => {
+                        if (activeSegmentRef.current && currentTime >= activeSegmentRef.current.end) {
+                            playbackWavesurferRef.current.pause();
+                            setActiveSegment(null);
+                            activeSegmentRef.current = null;
+                        }
+                    });
+                }
+
+                return () => {
+                    if (playbackWavesurferRef.current) {
+                        playbackWavesurferRef.current.destroy();
+                        playbackWavesurferRef.current = null;
+                    }
+                };
+            }, [audioBlob]);
+
+            const startRecording = useCallback(async () => {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ 
+                        audio: {
+                            channelCount: 1,
+                            sampleRate: 16000,
+                            echoCancellation: true,
+                            noiseSuppression: true
+                        } 
+                    });
+                    streamRef.current = stream;
+
+                    // Clear previous state
+                    audioChunksRef.current = [];
+                    lastProcessedChunkRef.current = 0;
+                    processingRef.current = false;
+                    setSegments([]);
+                    setEvents([]);
+                    setSpeakers([]);
+                    speakerMap.clear();
+                    setActiveSegment(null);
+                    activeSegmentRef.current = null;
+
+                    // Cleanup previous playback wavesurfer
+                    if (playbackWavesurferRef.current) {
+                        playbackWavesurferRef.current.destroy();
+                        playbackWavesurferRef.current = null;
+                    }
+                    setAudioBlob(null);
+
+                    // Create MediaRecorder
+                    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
+                        ? 'audio/webm;codecs=opus' 
+                        : 'audio/webm';
+                    
+                    mediaRecorderRef.current = new MediaRecorder(stream, { mimeType });
+
+                    mediaRecorderRef.current.ondataavailable = async (event) => {
+                        if (event.data.size > 0) {
+                            audioChunksRef.current.push(event.data);
+                            
+                            // Stream to backend every 3 chunks (3 seconds) for real-time results
+                            if (audioChunksRef.current.length >= 3 && 
+                                audioChunksRef.current.length % 2 === 0 &&
+                                !processingRef.current) {
+                                const blob = new Blob(audioChunksRef.current, { type: mimeType });
+                                // Process in background, don't await
+                                processStreamingDiarization(blob, true);
+                            }
+                        }
+                    };
+
+                    mediaRecorderRef.current.onstop = async () => {
+                        const blob = new Blob(audioChunksRef.current, { type: mimeType });
+                        setAudioBlob(blob);
+                        
+                        // Final diarization with complete audio
+                        await processStreamingDiarization(blob, false);
+                    };
+
+                    // Start recording with timeslice for streaming (1 second chunks)
+                    mediaRecorderRef.current.start(1000);
+                    setIsRecording(true);
+                    setStatus('recording');
+                    setStatusText('Recording... Results will appear in real-time');
+
+                    // Start live visualization using AudioContext
+                    const audioContext = new AudioContext();
+                    const source = audioContext.createMediaStreamSource(stream);
+                    const analyser = audioContext.createAnalyser();
+                    analyser.fftSize = 2048;
+                    source.connect(analyser);
+
+                    const bufferLength = analyser.frequencyBinCount;
+                    const dataArray = new Uint8Array(bufferLength);
+
+                    const updateWaveform = () => {
+                        if (!isRecording && !mediaRecorderRef.current?.state === 'recording') return;
+                        
+                        analyser.getByteTimeDomainData(dataArray);
+                        
+                        // Create a simple visualization
+                        if (wavesurferRef.current) {
+                            // We'll update the container background to show activity
+                            const average = dataArray.reduce((a, b) => a + Math.abs(b - 128), 0) / bufferLength;
+                            const intensity = Math.min(average / 50, 1);
+                            waveformRef.current.style.boxShadow = `inset 0 0 ${20 + intensity * 30}px rgba(74, 158, 255, ${intensity * 0.5})`;
+                        }
+                        
+                        if (mediaRecorderRef.current?.state === 'recording') {
+                            requestAnimationFrame(updateWaveform);
+                        }
+                    };
+                    
+                    updateWaveform();
+
+                } catch (error) {
+                    console.error('Error starting recording:', error);
+                    setStatus('ready');
+                    setStatusText('Error: Could not access microphone');
+                }
+            }, [speakerMap, processStreamingDiarization]);
+
+            const stopRecording = useCallback(() => {
+                if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+                    mediaRecorderRef.current.stop();
+                }
+                if (streamRef.current) {
+                    streamRef.current.getTracks().forEach(track => track.stop());
+                    streamRef.current = null;
+                }
+                setIsRecording(false);
+                setStatus('processing');
+                setStatusText('Finalizing analysis...');
+                
+                // Reset waveform glow
+                if (waveformRef.current) {
+                    waveformRef.current.style.boxShadow = 'none';
+                }
+            }, []);
+
+            const handleDiarizationEvent = useCallback((event) => {
+                setEvents(prev => [...prev, event]);
+
+                switch (event.event) {
+                    case 'start':
+                        setDuration(event.duration);
+                        setSpeakers(event.speakers || []);
+                        break;
+                    case 'segment':
+                        setSegments(prev => [...prev, {
+                            start: event.start,
+                            end: event.end,
+                            speaker: event.speaker
+                        }]);
+                        break;
+                    case 'speaker_change':
+                        // Speaker change events are handled in real-time
+                        break;
+                    case 'done':
+                        if (!mediaRecorderRef.current || mediaRecorderRef.current.state !== 'recording') {
+                            setStatus('ready');
+                            setStatusText('Analysis complete');
+                        }
+                        break;
+                }
+            }, []);
+
+            const processStreamingDiarization = useCallback(async (blob, isPartial = false) => {
+                if (processingRef.current) return;
+                processingRef.current = true;
+
+                try {
+                    const formData = new FormData();
+                    formData.append('file', blob, 'recording.webm');
+                    formData.append('response_format', 'diarized_json');
+                    formData.append('stream', 'true');
+                    formData.append('vad', 'true');
+                    formData.append('chunk_size', '2.0');
+                    formData.append('chunk_hop', '0.5');
+
+                    const response = await fetch('/v1/audio/transcriptions', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+
+                    // Clear previous segments for fresh analysis if partial
+                    if (isPartial) {
+                        setSegments([]);
+                        setEvents([]);
+                    }
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+
+                        buffer += decoder.decode(value, { stream: true });
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop() || '';
+
+                        for (const line of lines) {
+                            if (line.trim()) {
+                                try {
+                                    const event = JSON.parse(line);
+                                    handleDiarizationEvent(event);
+                                } catch (e) {
+                                    console.error('Error parsing event:', e);
+                                }
+                            }
+                        }
+                    }
+
+                    if (!isPartial) {
+                        setStatus('ready');
+                        setStatusText('Recording complete - Click play to listen');
+                    }
+
+                } catch (error) {
+                    console.error('Error processing diarization:', error);
+                    if (!isPartial) {
+                        setStatus('ready');
+                        setStatusText('Error processing audio');
+                    }
+                } finally {
+                    processingRef.current = false;
+                }
+            }, [handleDiarizationEvent]);
+
+            const togglePlayback = useCallback(() => {
+                if (playbackWavesurferRef.current) {
+                    playbackWavesurferRef.current.playPause();
+                }
+            }, []);
+
+            const seekToSegment = useCallback((segment) => {
+                if (playbackWavesurferRef.current && duration > 0) {
+                    // Set active segment for tracking
+                    setActiveSegment(segment);
+                    activeSegmentRef.current = segment;
+                    
+                    // Seek to the position (0-1 range)
+                    const position = segment.start / duration;
+                    playbackWavesurferRef.current.seekTo(position);
+                    // Start playing
+                    playbackWavesurferRef.current.play();
+                }
+            }, [duration]);
+
+            const clearActiveSegment = useCallback(() => {
+                setActiveSegment(null);
+                activeSegmentRef.current = null;
+            }, []);
+
+            return (
+                <div className="container">
+                    <h1>🎤 VectorMe Voice Recorder</h1>
+                    
+                    <div className="card">
+                        <div className={`status ${status}`}>
+                            {status === 'recording' && (
+                                <span className="live-indicator">
+                                    <span className="live-dot"></span>
+                                </span>
+                            )}
+                            {statusText}
+                        </div>
+
+                        <div className="waveform-container" ref={waveformRef}>
+                            {!isRecording && !audioBlob && (
+                                <div style={{ 
+                                    height: '80px', 
+                                    display: 'flex', 
+                                    alignItems: 'center', 
+                                    justifyContent: 'center',
+                                    color: '#666'
+                                }}>
+                                    Click Record to start
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="controls">
+                            {!isRecording ? (
+                                <button 
+                                    className="btn-record" 
+                                    onClick={startRecording}
+                                    disabled={status === 'processing'}
+                                >
+                                    🎙️ Record
+                                </button>
+                            ) : (
+                                <button 
+                                    className="btn-stop recording" 
+                                    onClick={stopRecording}
+                                >
+                                    ⏹️ Stop
+                                </button>
+                            )}
+                        </div>
+                    </div>
+
+                    {audioBlob && (
+                        <div className="card">
+                            <h3>📼 Recorded Audio</h3>
+                            <div className="waveform-container" ref={playbackWaveformRef}></div>
+                            <div className="controls">
+                                <button 
+                                    className="btn-play" 
+                                    onClick={togglePlayback}
+                                    disabled={!playbackWavesurferRef.current}
+                                >
+                                    {isPlaying ? '⏸️ Pause' : '▶️ Play'}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {segments.length > 0 && (
+                        <div className="card">
+                            <h3>🎯 Speaker Diarization</h3>
+                            
+                            {speakers.length > 0 && (
+                                <div className="speaker-list">
+                                    <span style={{ color: '#888', marginRight: '8px' }}>Known speakers:</span>
+                                    {speakers.map((speaker, i) => (
+                                        <span 
+                                            key={speaker} 
+                                            className="speaker-badge"
+                                            style={{ background: getSpeakerColor(speaker, speakerMap) }}
+                                        >
+                                            {speaker}
+                                        </span>
+                                    ))}
+                                </div>
+                            )}
+
+                            {duration > 0 && (
+                                <>
+                                <div className="timeline">
+                                    {segments.map((seg, i) => {
+                                        const left = (seg.start / duration) * 100;
+                                        const width = ((seg.end - seg.start) / duration) * 100;
+                                        const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
+                                        return (
+                                            <div
+                                                key={i}
+                                                className={`timeline-segment ${isActive ? 'active' : ''}`}
+                                                onClick={() => seekToSegment(seg)}
+                                                style={{
+                                                    left: `${left}%`,
+                                                    width: `${width}%`,
+                                                    background: getSpeakerColor(seg.speaker, speakerMap),
+                                                    cursor: audioBlob ? 'pointer' : 'default'
+                                                }}
+                                                title={`${seg.speaker || 'Unknown'}: ${formatTime(seg.start)} - ${formatTime(seg.end)}${audioBlob ? ' (click to play)' : ''}`}
+                                            >
+                                                {width > 10 ? (seg.speaker || '?') : ''}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                                {activeSegment && (
+                                    <div className="timeline-info">
+                                        <div className="timeline-info-item">
+                                            <span className="timeline-info-label">Speaker:</span>
+                                            <span className="timeline-info-value" style={{ color: getSpeakerColor(activeSegment.speaker, speakerMap) }}>
+                                                {activeSegment.speaker || 'Unknown'}
+                                            </span>
+                                        </div>
+                                        <div className="timeline-info-item">
+                                            <span className="timeline-info-label">Start:</span>
+                                            <span className="timeline-info-value">{formatTime(activeSegment.start)}</span>
+                                        </div>
+                                        <div className="timeline-info-item">
+                                            <span className="timeline-info-label">Duration:</span>
+                                            <span className="timeline-info-value">{(activeSegment.end - activeSegment.start).toFixed(1)}s</span>
+                                        </div>
+                                        <div className="timeline-info-item">
+                                            <span className="timeline-info-label">End:</span>
+                                            <span className="timeline-info-value">{formatTime(activeSegment.end)}</span>
+                                        </div>
+                                        <button 
+                                            onClick={clearActiveSegment}
+                                            style={{ 
+                                                background: 'transparent', 
+                                                border: 'none', 
+                                                color: '#888', 
+                                                cursor: 'pointer',
+                                                padding: '0 4px',
+                                                fontSize: '16px'
+                                            }}
+                                            title="Clear selection"
+                                        >✕</button>
+                                    </div>
+                                )}
+                                </>
+                            )}
+
+                            <div className="diarization-results">
+                                {segments.map((seg, i) => {
+                                    const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
+                                    return (
+                                    <div 
+                                        key={i} 
+                                        className={`segment ${isActive ? 'active' : ''}`}
+                                        onClick={() => seekToSegment(seg)}
+                                        style={{ cursor: audioBlob ? 'pointer' : 'default' }}
+                                        title={audioBlob ? 'Click to play from this segment' : 'Record audio to enable playback'}
+                                    >
+                                        <span className="segment-time">
+                                            {formatTime(seg.start)} → {formatTime(seg.end)}
+                                        </span>
+                                        <span 
+                                            className={`segment-speaker ${seg.speaker ? 'known' : 'unknown'}`}
+                                            style={seg.speaker ? { background: getSpeakerColor(seg.speaker, speakerMap) } : {}}
+                                        >
+                                            {seg.speaker || 'Unknown Speaker'}
+                                        </span>
+                                        {audioBlob && <span className="segment-play-icon">{isActive ? '⏸' : '▶'}</span>}
+                                    </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    )}
+
+                    {events.length > 0 && (
+                        <div className="card">
+                            <h3>📋 Events Log</h3>
+                            <div className="events-log">
+                                {events.map((evt, i) => (
+                                    <div key={i} className="event-item">
+                                        <span className="event-type">[{evt.event}]</span>{' '}
+                                        {JSON.stringify(evt)}
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<VoiceRecorder />);
+    </script>
+</body>
+</html>
