@@ -8,6 +8,7 @@
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <script src="https://unpkg.com/wavesurfer.js@7"></script>
+    <script src="https://unpkg.com/wavesurfer.js@7/dist/plugins/regions.min.js"></script>
     <script src="https://unpkg.com/wavesurfer.js@7/dist/plugins/record.esm.js" type="module"></script>
     <style>
         * {
@@ -700,6 +701,7 @@
             const [savedRecordings, setSavedRecordings] = useState([]);
             const [recordingName, setRecordingName] = useState('');
             const [currentTime, setCurrentTime] = useState(0);
+            const [selection, setSelection] = useState(null); // {start, end} for drag selection
             const [isSavingRecording, setIsSavingRecording] = useState(false);
             const [isLoadingRecording, setIsLoadingRecording] = useState(false);
 
@@ -707,6 +709,7 @@
             const playbackWaveformRef = useRef(null);
             const wavesurferRef = useRef(null);
             const playbackWavesurferRef = useRef(null);
+            const regionsRef = useRef(null);
             const mediaRecorderRef = useRef(null);
             const audioChunksRef = useRef([]);
             const streamRef = useRef(null);
@@ -745,6 +748,10 @@
             // Initialize playback waveform when audio is available
             useEffect(() => {
                 if (playbackWaveformRef.current && audioBlob && !playbackWavesurferRef.current) {
+                    // Create regions plugin for drag selection
+                    const regions = WaveSurfer.Regions.create();
+                    regionsRef.current = regions;
+
                     playbackWavesurferRef.current = WaveSurfer.create({
                         container: playbackWaveformRef.current,
                         waveColor: '#4a9eff',
@@ -755,6 +762,30 @@
                         barRadius: 2,
                         height: 50,
                         normalize: true,
+                        plugins: [regions],
+                    });
+
+                    // Enable drag selection to create regions
+                    regions.enableDragSelection({
+                        color: 'rgba(0, 210, 255, 0.3)',
+                    });
+
+                    // When a region is created or updated
+                    regions.on('region-created', (region) => {
+                        // Remove any existing regions first (only allow one selection)
+                        regions.getRegions().forEach(r => {
+                            if (r.id !== region.id) r.remove();
+                        });
+                        setSelection({ start: region.start, end: region.end });
+                    });
+
+                    regions.on('region-updated', (region) => {
+                        setSelection({ start: region.start, end: region.end });
+                    });
+
+                    // Double-click on region to play it
+                    regions.on('region-double-clicked', (region) => {
+                        region.play();
                     });
 
                     const url = URL.createObjectURL(audioBlob);
@@ -772,7 +803,7 @@
                         setIsPlaying(false);
                     });
 
-                    // Listen for timeupdate to track position and stop at segment end
+                    // Listen for timeupdate to track position and stop at segment/selection end
                     playbackWavesurferRef.current.on('timeupdate', (time) => {
                         setCurrentTime(time);
                         if (activeSegmentRef.current && time >= activeSegmentRef.current.end) {
@@ -787,6 +818,8 @@
                     if (playbackWavesurferRef.current) {
                         playbackWavesurferRef.current.destroy();
                         playbackWavesurferRef.current = null;
+                        regionsRef.current = null;
+                        setSelection(null);
                     }
                 };
             }, [audioBlob]);
@@ -1416,7 +1449,7 @@
                                 marginBottom: '8px'
                             }}>
                                 <span>{formatTime(currentTime)}</span>
-                                <span style={{ color: '#888' }}>Press Space to play/pause</span>
+                                <span style={{ color: '#888' }}>{selection ? `Selection: ${formatTime(selection.start)} - ${formatTime(selection.end)}` : 'Drag to select • Space to play/pause'}</span>
                                 <span>{formatTime(duration)}</span>
                             </div>
                             <div className="controls">
@@ -1427,6 +1460,32 @@
                                 >
                                     {isPlaying ? '⏸️ Pause' : '▶️ Play'}
                                 </button>
+                                {selection && (
+                                    <button 
+                                        className="btn-play" 
+                                        onClick={() => {
+                                            const regions = regionsRef.current?.getRegions();
+                                            if (regions && regions.length > 0) {
+                                                regions[0].play();
+                                            }
+                                        }}
+                                        style={{ background: 'linear-gradient(135deg, #667eea, #764ba2)' }}
+                                    >
+                                        ▶️ Play Selection
+                                    </button>
+                                )}
+                                {selection && (
+                                    <button 
+                                        className="btn-play" 
+                                        onClick={() => {
+                                            regionsRef.current?.clearRegions();
+                                            setSelection(null);
+                                        }}
+                                        style={{ background: 'rgba(255, 255, 255, 0.1)', color: '#888' }}
+                                    >
+                                        ✕ Clear
+                                    </button>
+                                )}
                             </div>
                             
                             {/* Save Recording Form */}
