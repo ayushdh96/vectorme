@@ -92,11 +92,13 @@ vectorme --file conversation.m4a --diarize
 
 Output (NDJSON - one JSON object per line):
 ```json
-{"event": "segment", "start": 0.0, "end": 1.0, "speaker": null}
-{"event": "segment", "start": 1.0, "end": 3.0, "speaker": "Doug"}
-{"event": "segment", "start": 3.0, "end": 4.5, "speaker": null}
-{"event": "segment", "start": 4.5, "end": 8.0, "speaker": "Ayush"}
+{"event": "segment", "start": 0.0, "end": 1.0, "speaker": null, "vad_confidence": 0.82}
+{"event": "segment", "start": 1.0, "end": 3.0, "speaker": "Doug", "vad_confidence": 0.91}
+{"event": "segment", "start": 3.0, "end": 4.5, "speaker": null, "vad_confidence": 0.78}
+{"event": "segment", "start": 4.5, "end": 8.0, "speaker": "Ayush", "vad_confidence": 0.85}
 ```
+
+The `vad_confidence` field indicates the average speech probability for each segment (0.0-1.0). Higher values indicate higher confidence that the segment contains speech. This field is only included when VAD is enabled (default).
 
 **Voice Activity Detection (VAD):**
 
@@ -220,14 +222,18 @@ curl -N -X POST http://localhost:3120/v1/audio/transcriptions \
 
 Real-time NDJSON output:
 ```
-{"event": "start", "duration": 59.07, "speakers": ["Ayush", "Doug"]}
-{"event": "speaker_change", "time": 0.0, "speaker": null, "similarity": 0.41}
-{"event": "segment", "start": 0.0, "end": 1.0, "speaker": null}
-{"event": "speaker_change", "time": 1.0, "speaker": "Doug", "similarity": 0.54}
-{"event": "segment", "start": 1.0, "end": 3.0, "speaker": "Doug"}
+{"event": "start", "duration": 59.07, "speakers": ["Ayush", "Doug"], "vad": true}
+{"event": "speaker_change", "time": 0.0, "speaker": null, "similarity": 0.41, "vad_confidence": 0.85}
+{"event": "segment", "start": 0.0, "end": 1.0, "speaker": null, "vad_confidence": 0.82}
+{"event": "speaker_change", "time": 1.0, "speaker": "Doug", "similarity": 0.54, "vad_confidence": 0.91}
+{"event": "segment", "start": 1.0, "end": 3.0, "speaker": "Doug", "vad_confidence": 0.88}
 ...
 {"event": "done"}
 ```
+
+**Event fields:**
+- `segment.vad_confidence` - Average VAD speech probability for the segment (0.0-1.0, only when VAD enabled)
+- `speaker_change.vad_confidence` - VAD confidence at the speaker change point (only when VAD enabled)
 
 **Additional parameters:**
 - `chunk_size` - Chunk duration in seconds (default: 3.0, matches ECAPA-TDNN training)

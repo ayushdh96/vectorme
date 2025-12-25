@@ -250,6 +250,41 @@ class SileroVAD:
         
         total_speech = sum(ts['end'] - ts['start'] for ts in speech_timestamps)
         return total_speech / len(waveform)
+    
+    def get_speech_confidence(self, waveform, sample_rate=16000):
+        """Get speech confidence (probability) for the waveform.
+        
+        Returns tuple: (has_speech: bool, confidence: float, speech_ratio: float)
+        - has_speech: True if speech detected above threshold
+        - confidence: Average speech probability across the waveform (0.0-1.0)
+        - speech_ratio: Ratio of speech frames to total frames (0.0-1.0)
+        """
+        if waveform.dim() == 2:
+            waveform = waveform.squeeze(0)
+        
+        # Reset model state for clean inference
+        self.model.reset_states()
+        
+        # Get frame-level probabilities using windowed approach
+        # Silero VAD works on 512 sample windows at 16kHz (32ms)
+        window_size = 512
+        probabilities = []
+        
+        for i in range(0, len(waveform) - window_size + 1, window_size):
+            chunk = waveform[i:i + window_size]
+            prob = self.model(chunk, sample_rate).item()
+            probabilities.append(prob)
+        
+        if not probabilities:
+            return (False, 0.0, 0.0)
+        
+        # Calculate metrics
+        avg_confidence = sum(probabilities) / len(probabilities)
+        speech_frames = sum(1 for p in probabilities if p >= self.threshold)
+        speech_ratio = speech_frames / len(probabilities)
+        has_speech = speech_ratio > 0.1  # At least 10% of frames have speech
+        
+        return (has_speech, avg_confidence, speech_ratio)
 
 
 def process_chunks(args, classifier, torchaudio, torch, db, vad=None):
@@ -287,6 +322,7 @@ def process_chunks(args, classifier, torchaudio, torch, db, vad=None):
         
         prev_embedding = None
         prev_speaker = None
+        prev_vad_confidence = None
         segment_start = 0.0
         
         position = 0
@@ -300,29 +336,36 @@ def process_chunks(args, classifier, torchaudio, torch, db, vad=None):
             
             current_time = position / sample_rate
             
-            # VAD check - skip non-speech chunks
-            if vad is not None and not vad.has_speech(chunk, sample_rate):
-                # No speech detected - treat as silence
-                if prev_speaker is not None:
-                    # Emit previous segment before silence
-                    if segment_start is not None and segment_start < current_time:
-                        event = {
-                            "event": "segment",
-                            "start": round(segment_start, 2),
-                            "end": round(current_time, 2),
-                            "speaker": prev_speaker
-                        }
-                        print(json.dumps(event))
-                    prev_speaker = None
-                    prev_embedding = None
-                # Mark that we're in silence
-                segment_start = None
-                position += hop_samples
-                continue
+            # VAD check - get speech confidence
+            vad_confidence = None
+            if vad is not None:
+                has_speech, vad_confidence, vad_speech_ratio = vad.get_speech_confidence(chunk, sample_rate)
+                if not has_speech:
+                    # No speech detected - treat as silence
+                    if prev_speaker is not None:
+                        # Emit previous segment before silence
+                        if segment_start is not None and segment_start < current_time:
+                            event = {
+                                "event": "segment",
+                                "start": round(segment_start, 2),
+                                "end": round(current_time, 2),
+                                "speaker": prev_speaker
+                            }
+                            if prev_vad_confidence is not None:
+                                event["vad_confidence"] = round(prev_vad_confidence, 3)
+                            print(json.dumps(event))
+                        prev_speaker = None
+                        prev_embedding = None
+                        prev_vad_confidence = None
+                    # Mark that we're in silence
+                    segment_start = None
+                    position += hop_samples
+                    continue
             
             # If we were in silence and speech resumed, update segment_start
             if segment_start is None:
                 segment_start = current_time
+                prev_vad_confidence = vad_confidence
             
             # Extract embedding for this chunk
             with torch.no_grad():
@@ -358,10 +401,13 @@ def process_chunks(args, classifier, torchaudio, torch, db, vad=None):
                         "end": round(current_time, 2),
                         "speaker": prev_speaker
                     }
+                    if prev_vad_confidence is not None:
+                        event["vad_confidence"] = round(prev_vad_confidence, 3)
                     print(json.dumps(event))
                 
                 segment_start = current_time
                 prev_speaker = current_speaker
+                prev_vad_confidence = vad_confidence
                 
                 # Emit speaker change event
                 event = {
@@ -370,7 +416,15 @@ def process_chunks(args, classifier, torchaudio, torch, db, vad=None):
                     "speaker": current_speaker,
                     "similarity": round(current_similarity, 3)
                 }
+                if vad_confidence is not None:
+                    event["vad_confidence"] = round(vad_confidence, 3)
                 print(json.dumps(event))
+            else:
+                # Track running average of VAD confidence for the segment
+                if vad_confidence is not None and prev_vad_confidence is not None:
+                    prev_vad_confidence = (prev_vad_confidence + vad_confidence) / 2
+                elif vad_confidence is not None:
+                    prev_vad_confidence = vad_confidence
             
             prev_embedding = embedding
             position += hop_samples
@@ -384,6 +438,8 @@ def process_chunks(args, classifier, torchaudio, torch, db, vad=None):
                 "end": round(final_time, 2),
                 "speaker": prev_speaker
             }
+            if prev_vad_confidence is not None:
+                event["vad_confidence"] = round(prev_vad_confidence, 3)
             print(json.dumps(event))
         
     finally:
@@ -585,6 +641,7 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
             
             prev_embedding = None
             prev_speaker = None
+            prev_vad_confidence = None
             segment_start = 0.0
             
             position = 0
@@ -597,29 +654,36 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                 
                 current_time = position / sample_rate
                 
-                # VAD check - skip non-speech chunks
-                if vad is not None and not vad.has_speech(chunk, sample_rate):
-                    # No speech detected
-                    if prev_speaker is not None:
-                        # Emit previous segment before silence
-                        if segment_start < current_time:
-                            if not filter_unknown or prev_speaker is not None:
-                                yield json.dumps({
-                                    "event": "segment",
-                                    "start": round(segment_start, 2),
-                                    "end": round(current_time, 2),
-                                    "speaker": prev_speaker
-                                }) + "\n"
-                        prev_speaker = None
-                        prev_embedding = None
-                    # Don't update segment_start here - we'll set it when speech resumes
-                    segment_start = None  # Mark that we're in silence
-                    position += hop_samples
-                    continue
+                # VAD check - get speech confidence
+                vad_confidence = None
+                vad_speech_ratio = None
+                if vad is not None:
+                    has_speech, vad_confidence, vad_speech_ratio = vad.get_speech_confidence(chunk, sample_rate)
+                    if not has_speech:
+                        # No speech detected
+                        if prev_speaker is not None:
+                            # Emit previous segment before silence
+                            if segment_start < current_time:
+                                if not filter_unknown or prev_speaker is not None:
+                                    yield json.dumps({
+                                        "event": "segment",
+                                        "start": round(segment_start, 2),
+                                        "end": round(current_time, 2),
+                                        "speaker": prev_speaker,
+                                        "vad_confidence": round(prev_vad_confidence, 3) if prev_vad_confidence else None
+                                    }) + "\n"
+                            prev_speaker = None
+                            prev_embedding = None
+                            prev_vad_confidence = None
+                        # Don't update segment_start here - we'll set it when speech resumes
+                        segment_start = None  # Mark that we're in silence
+                        position += hop_samples
+                        continue
                 
                 # If we were in silence and speech resumed, update segment_start
                 if segment_start is None:
                     segment_start = current_time
+                    prev_vad_confidence = vad_confidence
                 
                 with torch.no_grad():
                     embedding = classifier.encode_batch(chunk)
@@ -645,23 +709,36 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                     # Emit previous segment
                     if segment_start is not None and segment_start < current_time:
                         if not filter_unknown or prev_speaker is not None:
-                            yield json.dumps({
+                            segment_data = {
                                 "event": "segment",
                                 "start": round(segment_start, 2),
                                 "end": round(current_time, 2),
                                 "speaker": prev_speaker
-                            }) + "\n"
+                            }
+                            if prev_vad_confidence is not None:
+                                segment_data["vad_confidence"] = round(prev_vad_confidence, 3)
+                            yield json.dumps(segment_data) + "\n"
                     
                     segment_start = current_time
                     prev_speaker = current_speaker
+                    prev_vad_confidence = vad_confidence
                     
                     # Emit speaker change event
-                    yield json.dumps({
+                    change_data = {
                         "event": "speaker_change",
                         "time": round(current_time, 2),
                         "speaker": current_speaker,
                         "similarity": round(current_similarity, 3)
-                    }) + "\n"
+                    }
+                    if vad_confidence is not None:
+                        change_data["vad_confidence"] = round(vad_confidence, 3)
+                    yield json.dumps(change_data) + "\n"
+                else:
+                    # Track running average of VAD confidence for the segment
+                    if vad_confidence is not None and prev_vad_confidence is not None:
+                        prev_vad_confidence = (prev_vad_confidence + vad_confidence) / 2
+                    elif vad_confidence is not None:
+                        prev_vad_confidence = vad_confidence
                 
                 prev_embedding = embedding
                 position += hop_samples
@@ -669,12 +746,15 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
             # Final segment
             if segment_start is not None and segment_start < duration:
                 if not filter_unknown or prev_speaker is not None:
-                    yield json.dumps({
+                    segment_data = {
                         "event": "segment",
                         "start": round(segment_start, 2),
                         "end": round(duration, 2),
                         "speaker": prev_speaker
-                    }) + "\n"
+                    }
+                    if prev_vad_confidence is not None:
+                        segment_data["vad_confidence"] = round(prev_vad_confidence, 3)
+                    yield json.dumps(segment_data) + "\n"
             
             yield json.dumps({"event": "done"}) + "\n"
             
@@ -1281,6 +1361,11 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
     
     @app.route("/", methods=["GET"])
     def index():
+        return send_from_directory(static_folder, "index.html")
+    
+    @app.route("/recording/<recording_id>", methods=["GET"])
+    def recording_page(recording_id):
+        """Serve index.html for deep linking to recordings. Frontend handles routing."""
         return send_from_directory(static_folder, "index.html")
     
     print(f"Starting server on {host}:{port}", file=sys.stderr)

@@ -172,6 +172,27 @@
             color: #666;
             margin-left: 12px;
         }
+        .segment-vad-confidence {
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 11px;
+            color: #666;
+            margin-left: 8px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.05);
+        }
+        .segment-vad-confidence.high {
+            color: #38ef7d;
+            background: rgba(56, 239, 125, 0.1);
+        }
+        .segment-vad-confidence.medium {
+            color: #ffd200;
+            background: rgba(255, 210, 0, 0.1);
+        }
+        .segment-vad-confidence.low {
+            color: #ff6b8a;
+            background: rgba(255, 107, 138, 0.1);
+        }
         .timeline {
             position: relative;
             height: 40px;
@@ -601,6 +622,14 @@
             transform: scale(1.05);
             box-shadow: 0 4px 20px rgba(102, 126, 234, 0.4);
         }
+        .btn-share {
+            background: linear-gradient(135deg, #00d2ff, #3a7bd5);
+            color: white;
+        }
+        .btn-share:hover:not(:disabled) {
+            transform: scale(1.05);
+            box-shadow: 0 4px 20px rgba(0, 210, 255, 0.4);
+        }
         .empty-state {
             text-align: center;
             padding: 24px;
@@ -701,6 +730,7 @@
             // Saved recordings state
             const [savedRecordings, setSavedRecordings] = useState([]);
             const [recordingName, setRecordingName] = useState('');
+            const [currentRecordingId, setCurrentRecordingId] = useState(null);
             const [currentTime, setCurrentTime] = useState(0);
             const [selection, setSelection] = useState(null); // {start, end} for drag selection
             const [isSavingRecording, setIsSavingRecording] = useState(false);
@@ -876,6 +906,12 @@
                     speakerMap.clear();
                     setActiveSegment(null);
                     activeSegmentRef.current = null;
+                    setCurrentRecordingId(null);
+                    
+                    // Reset URL to home
+                    if (window.location.pathname !== '/') {
+                        window.history.pushState({}, '', '/');
+                    }
 
                     // Cleanup previous playback wavesurfer
                     if (playbackWavesurferRef.current) {
@@ -1270,6 +1306,29 @@
                 fetchRecordings();
             }, [fetchRecordings]);
             
+            // URL routing: load recording from path on mount
+            useEffect(() => {
+                const path = window.location.pathname;
+                const match = path.match(/^\/recording\/([a-zA-Z0-9_-]+)$/);
+                if (match) {
+                    const recordingId = match[1];
+                    // Fetch recording metadata and load it
+                    fetch(`/v1/recordings`)
+                        .then(res => res.json())
+                        .then(data => {
+                            const recording = (data.recordings || []).find(r => r.id === recordingId);
+                            if (recording) {
+                                loadRecording(recording);
+                            } else {
+                                console.error('Recording not found:', recordingId);
+                                // Navigate to home
+                                window.history.replaceState({}, '', '/');
+                            }
+                        })
+                        .catch(err => console.error('Error loading recording from URL:', err));
+                }
+            }, []); // Only run once on mount
+            
             // Save current recording
             const saveRecording = useCallback(async () => {
                 if (!audioBlob || isSavingRecording) return;
@@ -1312,6 +1371,10 @@
                 setIsLoadingRecording(true);
                 setStatus('processing');
                 setStatusText(`Loading "${recording.name}"...`);
+                setCurrentRecordingId(recording.id);
+                
+                // Update URL without page reload
+                window.history.pushState({ recordingId: recording.id }, '', `/recording/${recording.id}`);
                 
                 try {
                     // Fetch the audio file
@@ -1748,6 +1811,27 @@
                                 >
                                     {isSavingRecording ? '💾 Saving...' : '💾 Save'}
                                 </button>
+                                {currentRecordingId && (
+                                    <button
+                                        className="btn-share"
+                                        onClick={() => {
+                                            const url = `${window.location.origin}/recording/${currentRecordingId}`;
+                                            navigator.clipboard.writeText(url).then(() => {
+                                                // Show brief feedback
+                                                const btn = event.target;
+                                                const originalText = btn.innerText;
+                                                btn.innerText = '✓ Copied!';
+                                                setTimeout(() => btn.innerText = originalText, 2000);
+                                            }).catch(err => {
+                                                console.error('Failed to copy:', err);
+                                                prompt('Copy this link:', url);
+                                            });
+                                        }}
+                                        title="Copy link to this recording"
+                                    >
+                                        🔗 Copy Link
+                                    </button>
+                                )}
                             </div>
                         </div>
                     )}
@@ -1893,6 +1977,14 @@
                                         <span className="segment-time">
                                             {formatTime(seg.start)} → {formatTime(seg.end)}
                                         </span>
+                                        {seg.vad_confidence !== undefined && (
+                                            <span 
+                                                className={`segment-vad-confidence ${seg.vad_confidence >= 0.8 ? 'high' : seg.vad_confidence >= 0.5 ? 'medium' : 'low'}`}
+                                                title={`VAD confidence: ${(seg.vad_confidence * 100).toFixed(1)}%`}
+                                            >
+                                                🎤 {(seg.vad_confidence * 100).toFixed(0)}%
+                                            </span>
+                                        )}
                                         <span 
                                             className={`segment-speaker ${seg.speaker ? 'known' : 'unknown'}`}
                                             style={seg.speaker ? { background: getSpeakerColor(seg.speaker, speakerMap) } : {}}
