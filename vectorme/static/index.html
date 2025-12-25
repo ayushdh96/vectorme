@@ -1081,33 +1081,6 @@
                 }
             }, []);
 
-            const handleDiarizationEvent = useCallback((event) => {
-                setEvents(prev => [...prev, event]);
-
-                switch (event.event) {
-                    case 'start':
-                        setDuration(event.duration);
-                        setSpeakers(event.speakers || []);
-                        break;
-                    case 'segment':
-                        setSegments(prev => [...prev, {
-                            start: event.start,
-                            end: event.end,
-                            speaker: event.speaker
-                        }]);
-                        break;
-                    case 'speaker_change':
-                        // Speaker change events are handled in real-time
-                        break;
-                    case 'done':
-                        if (!mediaRecorderRef.current || mediaRecorderRef.current.state !== 'recording') {
-                            setStatus('ready');
-                            setStatusText('Analysis complete');
-                        }
-                        break;
-                }
-            }, []);
-
             const processStreamingDiarization = useCallback(async (blob, isPartial = false) => {
                 if (processingRef.current) return;
                 processingRef.current = true;
@@ -1164,7 +1137,8 @@
                                             newSegments.push({
                                                 start: event.start,
                                                 end: event.end,
-                                                speaker: event.speaker
+                                                speaker: event.speaker,
+                                                vad_confidence: event.vad_confidence
                                             });
                                             break;
                                     }
