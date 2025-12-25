@@ -704,6 +704,12 @@
             const [selection, setSelection] = useState(null); // {start, end} for drag selection
             const [isSavingRecording, setIsSavingRecording] = useState(false);
             const [isLoadingRecording, setIsLoadingRecording] = useState(false);
+            
+            // Speaker comparison state
+            const [compareSpeaker, setCompareSpeaker] = useState(null);
+            const [segmentSimilarities, setSegmentSimilarities] = useState({}); // {"start-end": similarity}
+            const [identifyingSegment, setIdentifyingSegment] = useState(null); // segment being identified
+            const [segmentIdentifications, setSegmentIdentifications] = useState({}); // {"start-end": {matches, top_match}}
 
             const waveformRef = useRef(null);
             const playbackWaveformRef = useRef(null);
@@ -1433,6 +1439,93 @@
                 await processStreamingDiarization(audioBlob, false);
             }, [audioBlob, processStreamingDiarization]);
 
+            // Compare all segments against a specific speaker
+            const compareToSpeaker = useCallback(async (speakerName) => {
+                if (!audioBlob || !segments.length) return;
+                
+                if (compareSpeaker === speakerName) {
+                    // Toggle off if clicking the same speaker
+                    setCompareSpeaker(null);
+                    setSegmentSimilarities({});
+                    return;
+                }
+                
+                setCompareSpeaker(speakerName);
+                setSegmentSimilarities({});
+                
+                try {
+                    const formData = new FormData();
+                    formData.append('file', audioBlob, 'recording.webm');
+                    formData.append('segments', JSON.stringify(segments.map(s => ({ start: s.start, end: s.end }))));
+                    
+                    const response = await fetch(`/v1/speakers/${encodeURIComponent(speakerName)}/compare`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error('Failed to compare segments');
+                    }
+                    
+                    const result = await response.json();
+                    const similarities = {};
+                    for (const seg of result.segments) {
+                        const key = `${seg.start}-${seg.end}`;
+                        similarities[key] = seg.similarity;
+                    }
+                    setSegmentSimilarities(similarities);
+                } catch (error) {
+                    console.error('Error comparing to speaker:', error);
+                    setCompareSpeaker(null);
+                }
+            }, [audioBlob, segments, compareSpeaker]);
+
+            // Identify a single segment against speaker database
+            const identifySegment = useCallback(async (seg, e) => {
+                e.stopPropagation();
+                if (!audioBlob) return;
+                
+                const segKey = `${seg.start}-${seg.end}`;
+                setIdentifyingSegment(segKey);
+                
+                try {
+                    const formData = new FormData();
+                    formData.append('file', audioBlob, 'recording.webm');
+                    formData.append('start', seg.start.toString());
+                    formData.append('end', seg.end.toString());
+                    
+                    const response = await fetch('/v1/speakers/identify-segment', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error('Failed to identify segment');
+                    }
+                    
+                    const result = await response.json();
+                    setSegmentIdentifications(prev => ({
+                        ...prev,
+                        [segKey]: result
+                    }));
+                    
+                    // If we got a top match, update the segment's speaker
+                    if (result.top_match && result.top_match.similarity >= 0.5) {
+                        setSegments(prev => prev.map(s => 
+                            s.start === seg.start && s.end === seg.end
+                                ? { ...s, speaker: result.top_match.name }
+                                : s
+                        ));
+                        // Update speaker color
+                        getSpeakerColor(result.top_match.name, speakerMap);
+                    }
+                } catch (error) {
+                    console.error('Error identifying segment:', error);
+                } finally {
+                    setIdentifyingSegment(null);
+                }
+            }, [audioBlob, speakerMap]);
+
             return (
                 <div className="container">
                     <h1>🎤 VectorMe Voice Recorder</h1>
@@ -1549,7 +1642,54 @@
                                         🏷️ Name Speaker
                                     </button>
                                 )}
+                                {selection && (
+                                    <button 
+                                        className="btn-play" 
+                                        onClick={(e) => identifySegment({ start: selection.start, end: selection.end }, e)}
+                                        disabled={identifyingSegment === `${selection.start}-${selection.end}`}
+                                        style={{ background: 'linear-gradient(135deg, #f7971e, #ffd200)', color: '#1a1a2e' }}
+                                    >
+                                        {identifyingSegment === `${selection.start}-${selection.end}` ? '⏳ Identifying...' : '🔍 Identify Speaker'}
+                                    </button>
+                                )}
                             </div>
+                            
+                            {/* Show identification results for selection */}
+                            {selection && segmentIdentifications[`${selection.start}-${selection.end}`] && (
+                                <div style={{
+                                    marginTop: '12px',
+                                    padding: '12px 16px',
+                                    background: 'rgba(0, 0, 0, 0.3)',
+                                    borderRadius: '8px',
+                                    fontSize: '14px'
+                                }}>
+                                    <div style={{ marginBottom: '8px', color: '#a0b0ff', fontWeight: 600 }}>
+                                        🔍 Identification Results
+                                    </div>
+                                    {segmentIdentifications[`${selection.start}-${selection.end}`].matches?.length > 0 ? (
+                                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                                            {segmentIdentifications[`${selection.start}-${selection.end}`].matches.map((match, idx) => (
+                                                <span 
+                                                    key={match.name}
+                                                    style={{
+                                                        padding: '6px 12px',
+                                                        borderRadius: '16px',
+                                                        background: idx === 0 ? getSpeakerColor(match.name, speakerMap) : 'rgba(255, 255, 255, 0.1)',
+                                                        color: idx === 0 ? 'white' : '#888',
+                                                        fontFamily: "'Monaco', 'Consolas', monospace",
+                                                        fontSize: '13px',
+                                                        border: idx === 0 ? '2px solid rgba(255, 255, 255, 0.5)' : 'none'
+                                                    }}
+                                                >
+                                                    {match.name}: {(match.similarity * 100).toFixed(0)}%
+                                                </span>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <span style={{ color: '#888' }}>No matching speakers found</span>
+                                    )}
+                                </div>
+                            )}
                             
                             {/* Save Recording Form */}
                             <div className="save-recording-form" style={{ marginTop: '16px' }}>
@@ -1593,16 +1733,39 @@
                             
                             {speakers.length > 0 && (
                                 <div className="speaker-list">
-                                    <span style={{ color: '#888', marginRight: '8px' }}>Known speakers:</span>
+                                    <span style={{ color: '#888', marginRight: '8px' }}>Compare to speaker:</span>
                                     {speakers.map((speaker, i) => (
                                         <span 
                                             key={speaker} 
                                             className="speaker-badge"
-                                            style={{ background: getSpeakerColor(speaker, speakerMap) }}
+                                            onClick={() => compareToSpeaker(speaker)}
+                                            style={{ 
+                                                background: getSpeakerColor(speaker, speakerMap),
+                                                cursor: 'pointer',
+                                                border: compareSpeaker === speaker ? '2px solid #fff' : '2px solid transparent',
+                                                boxShadow: compareSpeaker === speaker ? '0 0 12px rgba(255, 255, 255, 0.5)' : undefined
+                                            }}
+                                            title={compareSpeaker === speaker ? 'Click to clear comparison' : `Click to see similarity of all segments to ${speaker}`}
                                         >
                                             {speaker}
                                         </span>
                                     ))}
+                                    {compareSpeaker && (
+                                        <button
+                                            onClick={() => { setCompareSpeaker(null); setSegmentSimilarities({}); }}
+                                            style={{
+                                                background: 'rgba(255, 255, 255, 0.1)',
+                                                border: 'none',
+                                                color: '#888',
+                                                padding: '4px 8px',
+                                                borderRadius: '4px',
+                                                cursor: 'pointer',
+                                                fontSize: '12px'
+                                            }}
+                                        >
+                                            ✕ Clear
+                                        </button>
+                                    )}
                                 </div>
                             )}
 
@@ -1671,6 +1834,8 @@
                             <div className="diarization-results">
                                 {segments.map((seg, i) => {
                                     const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
+                                    const segKey = `${seg.start}-${seg.end}`;
+                                    const similarity = segmentSimilarities[segKey];
                                     return (
                                     <div 
                                         key={i} 
@@ -1688,7 +1853,33 @@
                                         >
                                             {seg.speaker || 'Unknown Speaker'}
                                         </span>
+                                        {compareSpeaker && similarity !== undefined && (
+                                            <span 
+                                                className="segment-similarity"
+                                                style={{
+                                                    color: similarity >= 0.7 ? '#38ef7d' : similarity >= 0.5 ? '#ffd200' : '#ff6b8a',
+                                                    fontWeight: 600,
+                                                    fontSize: '13px',
+                                                    marginLeft: '8px',
+                                                    fontFamily: "'Monaco', 'Consolas', monospace"
+                                                }}
+                                                title={`Similarity to ${compareSpeaker}: ${(similarity * 100).toFixed(1)}%`}
+                                            >
+                                                {similarity !== null ? `${(similarity * 100).toFixed(0)}%` : '—'}
+                                            </span>
+                                        )}
                                         {audioBlob && <span className="segment-play-icon">{isActive ? '⏸' : '▶'}</span>}
+                                        {audioBlob && (
+                                            <button 
+                                                className="segment-name-btn"
+                                                onClick={(e) => identifySegment(seg, e)}
+                                                disabled={identifyingSegment === segKey}
+                                                title="Identify speaker for this segment"
+                                                style={{ marginLeft: '4px' }}
+                                            >
+                                                {identifyingSegment === segKey ? '⏳' : '🔍'} ID
+                                            </button>
+                                        )}
                                         {audioBlob && (
                                             <button 
                                                 className="segment-name-btn"
@@ -1697,6 +1888,20 @@
                                             >
                                                 ✏️ Name
                                             </button>
+                                        )}
+                                        {segmentIdentifications[segKey]?.top_match && (
+                                            <span 
+                                                style={{
+                                                    fontSize: '11px',
+                                                    color: segmentIdentifications[segKey].top_match.similarity >= 0.7 ? '#38ef7d' : 
+                                                           segmentIdentifications[segKey].top_match.similarity >= 0.5 ? '#ffd200' : '#ff6b8a',
+                                                    marginLeft: '8px',
+                                                    fontFamily: "'Monaco', 'Consolas', monospace"
+                                                }}
+                                                title={`Top matches: ${segmentIdentifications[segKey].matches.map(m => `${m.name}: ${(m.similarity * 100).toFixed(0)}%`).join(', ')}`}
+                                            >
+                                                → {segmentIdentifications[segKey].top_match.name} ({(segmentIdentifications[segKey].top_match.similarity * 100).toFixed(0)}%)
+                                            </span>
                                         )}
                                     </div>
                                     );

@@ -910,6 +910,178 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
             if temp_segment and os.path.exists(temp_segment):
                 os.unlink(temp_segment)
     
+    @app.route("/v1/speakers/<name>/compare", methods=["POST"])
+    def compare_to_speaker(name):
+        """Compare audio segments against a specific speaker's embedding."""
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        
+        # Get speaker's embeddings
+        if name not in db.list_names():
+            return jsonify({"error": f"Speaker '{name}' not found"}), 404
+        
+        # Get all embeddings for this speaker
+        speaker_indices = [i for i, n in enumerate(db.names) if n == name]
+        speaker_embeddings = db.embeddings[speaker_indices]
+        
+        # Get segment times from request
+        segments_json = request.form.get("segments", "[]")
+        try:
+            segments = json.loads(segments_json)
+        except json.JSONDecodeError:
+            return jsonify({"error": "Invalid segments JSON"}), 400
+        
+        if not segments:
+            return jsonify({"error": "No segments provided"}), 400
+        
+        file = request.files["file"]
+        audio_bytes = file.read()
+        
+        temp_path = None
+        temp_wav = None
+        
+        try:
+            temp_fd, temp_path = tempfile.mkstemp()
+            os.write(temp_fd, audio_bytes)
+            os.close(temp_fd)
+            
+            # Convert to WAV
+            temp_fd2, temp_wav = tempfile.mkstemp(suffix='.wav')
+            os.close(temp_fd2)
+            
+            result = subprocess.run(
+                ['ffmpeg', '-i', temp_path, '-ar', '16000', '-ac', '1', '-y', temp_wav],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg conversion failed: {result.stderr}")
+            
+            waveform, sample_rate = torchaudio.load(temp_wav)
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+            results = []
+            for seg in segments:
+                start = float(seg.get("start", 0))
+                end = float(seg.get("end", 0))
+                
+                # Extract segment
+                start_sample = int(start * sample_rate)
+                end_sample = int(end * sample_rate)
+                segment_waveform = waveform[:, start_sample:end_sample]
+                
+                if segment_waveform.shape[1] < sample_rate * 0.1:  # Skip very short segments
+                    results.append({"start": start, "end": end, "similarity": None})
+                    continue
+                
+                # Get embedding for this segment
+                with torch.no_grad():
+                    embedding = classifier.encode_batch(segment_waveform)
+                    embedding = embedding.squeeze().cpu().numpy()
+                
+                # Compute similarity against all speaker embeddings, take max
+                max_similarity = 0.0
+                for speaker_emb in speaker_embeddings:
+                    sim = cosine_similarity(embedding, speaker_emb)
+                    max_similarity = max(max_similarity, sim)
+                
+                results.append({
+                    "start": start,
+                    "end": end,
+                    "similarity": round(max_similarity, 3)
+                })
+            
+            return jsonify({"speaker": name, "segments": results})
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+            if temp_wav and os.path.exists(temp_wav):
+                os.unlink(temp_wav)
+    
+    @app.route("/v1/speakers/identify-segment", methods=["POST"])
+    def identify_segment():
+        """Identify the speaker for a specific audio segment."""
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        
+        start = float(request.form.get("start", 0))
+        end = float(request.form.get("end", 0))
+        
+        if end <= start:
+            return jsonify({"error": "Invalid segment times"}), 400
+        
+        file = request.files["file"]
+        audio_bytes = file.read()
+        
+        temp_path = None
+        temp_wav = None
+        
+        try:
+            temp_fd, temp_path = tempfile.mkstemp()
+            os.write(temp_fd, audio_bytes)
+            os.close(temp_fd)
+            
+            # Convert to WAV
+            temp_fd2, temp_wav = tempfile.mkstemp(suffix='.wav')
+            os.close(temp_fd2)
+            
+            result = subprocess.run(
+                ['ffmpeg', '-i', temp_path, '-ar', '16000', '-ac', '1', '-y', temp_wav],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg conversion failed: {result.stderr}")
+            
+            waveform, sample_rate = torchaudio.load(temp_wav)
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+            # Extract segment
+            start_sample = int(start * sample_rate)
+            end_sample = int(end * sample_rate)
+            segment_waveform = waveform[:, start_sample:end_sample]
+            
+            if segment_waveform.shape[1] < sample_rate * 0.1:
+                return jsonify({"error": "Segment too short"}), 400
+            
+            # Get embedding for this segment
+            with torch.no_grad():
+                embedding = classifier.encode_batch(segment_waveform)
+                embedding = embedding.squeeze().cpu().numpy()
+            
+            # Query database for matches
+            matches = db.query(embedding, top_k=5)
+            
+            # Group by speaker name and get best match per speaker
+            best_by_speaker = {}
+            for match in matches:
+                name = match["name"]
+                if name not in best_by_speaker or match["similarity"] > best_by_speaker[name]["similarity"]:
+                    best_by_speaker[name] = match
+            
+            # Sort by similarity
+            ranked = sorted(best_by_speaker.values(), key=lambda x: x["similarity"], reverse=True)
+            
+            return jsonify({
+                "start": start,
+                "end": end,
+                "matches": ranked,
+                "top_match": ranked[0] if ranked else None
+            })
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+            if temp_wav and os.path.exists(temp_wav):
+                os.unlink(temp_wav)
+    
     # ===== Recording Management Endpoints =====
     
     @app.route("/v1/recordings", methods=["GET"])
