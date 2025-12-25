@@ -802,6 +802,15 @@
                     const url = URL.createObjectURL(audioBlob);
                     playbackWavesurferRef.current.load(url);
 
+                    // Double-click on waveform (outside region) clears selection
+                    playbackWavesurferRef.current.on('dblclick', () => {
+                        if (regionsRef.current) {
+                            regionsRef.current.clearRegions();
+                        }
+                        setSelection(null);
+                        selectionRef.current = null;
+                    });
+
                     playbackWavesurferRef.current.on('finish', () => {
                         setIsPlaying(false);
                     });
@@ -1771,7 +1780,16 @@
 
                             {duration > 0 && (
                                 <>
-                                <div className="timeline">
+                                <div 
+                                    className="timeline"
+                                    onDoubleClick={() => {
+                                        if (selection) {
+                                            regionsRef.current?.clearRegions();
+                                            setSelection(null);
+                                            selectionRef.current = null;
+                                        }
+                                    }}
+                                >
                                     {segments.map((seg, i) => {
                                         const left = (seg.start / duration) * 100;
                                         const width = ((seg.end - seg.start) / duration) * 100;
