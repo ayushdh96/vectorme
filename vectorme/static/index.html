@@ -681,6 +681,7 @@
 
         function VoiceRecorder() {
             const [isRecording, setIsRecording] = useState(false);
+            const [isPaused, setIsPaused] = useState(false);
             const [isPlaying, setIsPlaying] = useState(false);
             const [status, setStatus] = useState('ready');
             const [statusText, setStatusText] = useState('Ready to record');
@@ -916,6 +917,7 @@
                     // Start recording with timeslice for streaming (1 second chunks)
                     mediaRecorderRef.current.start(1000);
                     setIsRecording(true);
+                    setIsPaused(false);
                     setStatus('recording');
                     setStatusText('Recording... Results will appear in real-time');
 
@@ -999,7 +1001,7 @@
             }, [speakerMap, processStreamingDiarization]);
 
             const stopRecording = useCallback(() => {
-                if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+                if (mediaRecorderRef.current && (mediaRecorderRef.current.state === 'recording' || mediaRecorderRef.current.state === 'paused')) {
                     mediaRecorderRef.current.stop();
                 }
                 if (streamRef.current) {
@@ -1017,12 +1019,29 @@
                     audioContextRef.current = null;
                 }
                 setIsRecording(false);
+                setIsPaused(false);
                 setStatus('processing');
                 setStatusText('Finalizing analysis...');
                 
                 // Reset waveform glow
                 if (waveformRef.current) {
                     waveformRef.current.style.boxShadow = 'none';
+                }
+            }, []);
+
+            const pauseRecording = useCallback(() => {
+                if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+                    mediaRecorderRef.current.pause();
+                    setIsPaused(true);
+                    setStatusText('Recording paused');
+                }
+            }, []);
+
+            const resumeRecording = useCallback(() => {
+                if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'paused') {
+                    mediaRecorderRef.current.resume();
+                    setIsPaused(false);
+                    setStatusText('Recording... Results will appear in real-time');
                 }
             }, []);
 
@@ -1580,12 +1599,21 @@
                                     🎙️ Record
                                 </button>
                             ) : (
-                                <button 
-                                    className="btn-stop recording" 
-                                    onClick={stopRecording}
-                                >
-                                    ⏹️ Stop
-                                </button>
+                                <>
+                                    <button 
+                                        className="btn-play" 
+                                        onClick={isPaused ? resumeRecording : pauseRecording}
+                                        style={{ background: isPaused ? 'linear-gradient(135deg, #11998e, #38ef7d)' : 'linear-gradient(135deg, #f7971e, #ffd200)', color: isPaused ? 'white' : '#1a1a2e' }}
+                                    >
+                                        {isPaused ? '▶️ Resume' : '⏸️ Pause'}
+                                    </button>
+                                    <button 
+                                        className="btn-stop recording" 
+                                        onClick={stopRecording}
+                                    >
+                                        ⏹️ Stop
+                                    </button>
+                                </>
                             )}
                         </div>
                     </div>
