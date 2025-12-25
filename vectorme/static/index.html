@@ -710,6 +710,7 @@
             const wavesurferRef = useRef(null);
             const playbackWavesurferRef = useRef(null);
             const regionsRef = useRef(null);
+            const selectionRef = useRef(null);
             const mediaRecorderRef = useRef(null);
             const audioChunksRef = useRef([]);
             const streamRef = useRef(null);
@@ -776,11 +777,15 @@
                         regions.getRegions().forEach(r => {
                             if (r.id !== region.id) r.remove();
                         });
-                        setSelection({ start: region.start, end: region.end });
+                        const sel = { start: region.start, end: region.end };
+                        setSelection(sel);
+                        selectionRef.current = sel;
                     });
 
                     regions.on('region-updated', (region) => {
-                        setSelection({ start: region.start, end: region.end });
+                        const sel = { start: region.start, end: region.end };
+                        setSelection(sel);
+                        selectionRef.current = sel;
                     });
 
                     // Double-click on region to play it
@@ -806,10 +811,18 @@
                     // Listen for timeupdate to track position and stop at segment/selection end
                     playbackWavesurferRef.current.on('timeupdate', (time) => {
                         setCurrentTime(time);
+                        // Stop at segment end if playing a segment
                         if (activeSegmentRef.current && time >= activeSegmentRef.current.end) {
                             playbackWavesurferRef.current.pause();
                             setActiveSegment(null);
                             activeSegmentRef.current = null;
+                        }
+                        // Stop at selection end if playing within a selection
+                        if (selectionRef.current && time >= selectionRef.current.end) {
+                            playbackWavesurferRef.current.pause();
+                            // Seek back to selection start for next play
+                            const position = selectionRef.current.start / playbackWavesurferRef.current.getDuration();
+                            playbackWavesurferRef.current.seekTo(position);
                         }
                     });
                 }
@@ -820,6 +833,7 @@
                         playbackWavesurferRef.current = null;
                         regionsRef.current = null;
                         setSelection(null);
+                        selectionRef.current = null;
                     }
                 };
             }, [audioBlob]);
@@ -1122,7 +1136,20 @@
 
             const togglePlayback = useCallback(() => {
                 if (playbackWavesurferRef.current) {
-                    playbackWavesurferRef.current.playPause();
+                    if (playbackWavesurferRef.current.isPlaying()) {
+                        playbackWavesurferRef.current.pause();
+                    } else {
+                        // If there's a selection, play from selection start
+                        if (selectionRef.current) {
+                            const currentTime = playbackWavesurferRef.current.getCurrentTime();
+                            // If cursor is outside selection, seek to selection start
+                            if (currentTime < selectionRef.current.start || currentTime >= selectionRef.current.end) {
+                                const position = selectionRef.current.start / playbackWavesurferRef.current.getDuration();
+                                playbackWavesurferRef.current.seekTo(position);
+                            }
+                        }
+                        playbackWavesurferRef.current.play();
+                    }
                 }
             }, []);
 
@@ -1136,7 +1163,20 @@
                         playbackWavesurferRef.current &&
                         audioBlob) {
                         e.preventDefault();
-                        playbackWavesurferRef.current.playPause();
+                        if (playbackWavesurferRef.current.isPlaying()) {
+                            playbackWavesurferRef.current.pause();
+                        } else {
+                            // If there's a selection, play from selection start
+                            if (selectionRef.current) {
+                                const currentTime = playbackWavesurferRef.current.getCurrentTime();
+                                // If cursor is outside selection, seek to selection start
+                                if (currentTime < selectionRef.current.start || currentTime >= selectionRef.current.end) {
+                                    const position = selectionRef.current.start / playbackWavesurferRef.current.getDuration();
+                                    playbackWavesurferRef.current.seekTo(position);
+                                }
+                            }
+                            playbackWavesurferRef.current.play();
+                        }
                     }
                 };
                 
@@ -1480,6 +1520,7 @@
                                         onClick={() => {
                                             regionsRef.current?.clearRegions();
                                             setSelection(null);
+                                            selectionRef.current = null;
                                         }}
                                         style={{ background: 'rgba(255, 255, 255, 0.1)', color: '#888' }}
                                     >
