@@ -29,6 +29,9 @@ warnings.filterwarnings("ignore")
 # Default database location
 DEFAULT_DB_PATH = Path.home() / ".vectorme" / "speakers.npz"
 
+# Default recordings directory
+DEFAULT_RECORDINGS_PATH = Path.home() / ".vectorme" / "recordings"
+
 
 class VectorDB:
     """Minimal vector database for speaker embeddings."""
@@ -498,16 +501,22 @@ def diarize_audio_bytes(audio_bytes, classifier, torchaudio, torch, db,
             os.unlink(temp_wav)
 
 
-def run_server(host, port, db_path, device="cpu"):
+def run_server(host, port, db_path, device="cpu", recordings_path=None):
     """Run HTTP server for audio diarization."""
-    from flask import Flask, request, jsonify, Response, send_from_directory
+    from flask import Flask, request, jsonify, Response, send_from_directory, send_file
     import torch
     import torchaudio
     from speechbrain.inference.speaker import EncoderClassifier
+    import uuid
+    from datetime import datetime
     
     # Get the directory where this file is located
     import os.path as osp
     static_folder = osp.join(osp.dirname(osp.abspath(__file__)), 'static')
+    
+    # Setup recordings directory
+    recordings_dir = Path(recordings_path) if recordings_path else DEFAULT_RECORDINGS_PATH
+    recordings_dir.mkdir(parents=True, exist_ok=True)
     
     app = Flask(__name__, static_folder=static_folder)
     
@@ -900,6 +909,199 @@ def run_server(host, port, db_path, device="cpu"):
                 os.unlink(temp_wav)
             if temp_segment and os.path.exists(temp_segment):
                 os.unlink(temp_segment)
+    
+    # ===== Recording Management Endpoints =====
+    
+    @app.route("/v1/recordings", methods=["GET"])
+    def list_recordings():
+        """List all saved recordings with metadata."""
+        recordings = []
+        for meta_file in recordings_dir.glob("*.json"):
+            try:
+                with open(meta_file, 'r') as f:
+                    metadata = json.load(f)
+                    # Check if the audio file exists
+                    audio_path = recordings_dir / metadata.get("filename", "")
+                    if audio_path.exists():
+                        recordings.append(metadata)
+            except (json.JSONDecodeError, IOError):
+                continue
+        # Sort by timestamp, newest first
+        recordings.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        return jsonify({"recordings": recordings, "count": len(recordings)})
+    
+    @app.route("/v1/recordings", methods=["POST"])
+    def save_recording():
+        """Save a recording with optional metadata."""
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        
+        file = request.files["file"]
+        audio_bytes = file.read()
+        
+        if len(audio_bytes) == 0:
+            return jsonify({"error": "Empty file"}), 400
+        
+        # Generate unique ID
+        recording_id = str(uuid.uuid4())[:8]
+        timestamp = datetime.now().isoformat()
+        
+        # Get optional metadata from form
+        name = request.form.get("name", f"Recording {recording_id}")
+        duration = request.form.get("duration", 0)
+        
+        # Write raw upload to temp file for conversion
+        temp_input = None
+        temp_wav = None
+        try:
+            temp_fd, temp_input = tempfile.mkstemp(suffix='.webm')
+            os.write(temp_fd, audio_bytes)
+            os.close(temp_fd)
+            
+            # Convert to clean WAV using ffmpeg to fix WebM chunk concatenation issues
+            # This normalizes the audio and removes any stuttering from timeslice recording
+            audio_filename = f"{recording_id}.wav"
+            audio_path = recordings_dir / audio_filename
+            
+            result = subprocess.run(
+                ['ffmpeg', '-i', temp_input, '-ar', '16000', '-ac', '1', '-y', str(audio_path)],
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode != 0:
+                # Fallback: save original file if conversion fails
+                audio_filename = f"{recording_id}.webm"
+                audio_path = recordings_dir / audio_filename
+                with open(audio_path, 'wb') as f:
+                    f.write(audio_bytes)
+            
+            # Get actual file size after conversion
+            file_size = audio_path.stat().st_size
+            
+            # Save metadata
+            metadata = {
+                "id": recording_id,
+                "name": name,
+                "filename": audio_filename,
+                "original_name": file.filename or "recording.webm",
+                "timestamp": timestamp,
+                "duration": float(duration) if duration else 0,
+                "size": file_size
+            }
+            
+            meta_path = recordings_dir / f"{recording_id}.json"
+            with open(meta_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            return jsonify({
+                "message": f"Recording saved as '{name}'",
+                "recording": metadata
+            })
+        finally:
+            if temp_input and os.path.exists(temp_input):
+                os.unlink(temp_input)
+    
+    @app.route("/v1/recordings/<recording_id>", methods=["GET"])
+    def get_recording(recording_id):
+        """Download a saved recording."""
+        meta_path = recordings_dir / f"{recording_id}.json"
+        if not meta_path.exists():
+            return jsonify({"error": "Recording not found"}), 404
+        
+        try:
+            with open(meta_path, 'r') as f:
+                metadata = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return jsonify({"error": "Invalid recording metadata"}), 500
+        
+        audio_path = recordings_dir / metadata.get("filename", "")
+        if not audio_path.exists():
+            return jsonify({"error": "Audio file not found"}), 404
+        
+        # Determine mimetype
+        ext = audio_path.suffix.lower()
+        mimetypes = {
+            ".webm": "audio/webm",
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".ogg": "audio/ogg"
+        }
+        mimetype = mimetypes.get(ext, "application/octet-stream")
+        
+        return send_file(
+            audio_path,
+            mimetype=mimetype,
+            as_attachment=False,
+            download_name=metadata.get("original_name", audio_path.name)
+        )
+    
+    @app.route("/v1/recordings/<recording_id>/metadata", methods=["GET"])
+    def get_recording_metadata(recording_id):
+        """Get metadata for a recording."""
+        meta_path = recordings_dir / f"{recording_id}.json"
+        if not meta_path.exists():
+            return jsonify({"error": "Recording not found"}), 404
+        
+        try:
+            with open(meta_path, 'r') as f:
+                metadata = json.load(f)
+            return jsonify(metadata)
+        except (json.JSONDecodeError, IOError):
+            return jsonify({"error": "Invalid recording metadata"}), 500
+    
+    @app.route("/v1/recordings/<recording_id>", methods=["DELETE"])
+    def delete_recording(recording_id):
+        """Delete a saved recording."""
+        meta_path = recordings_dir / f"{recording_id}.json"
+        if not meta_path.exists():
+            return jsonify({"error": "Recording not found"}), 404
+        
+        try:
+            with open(meta_path, 'r') as f:
+                metadata = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return jsonify({"error": "Invalid recording metadata"}), 500
+        
+        # Delete audio file
+        audio_path = recordings_dir / metadata.get("filename", "")
+        if audio_path.exists():
+            os.unlink(audio_path)
+        
+        # Delete metadata file
+        os.unlink(meta_path)
+        
+        return jsonify({
+            "message": f"Recording '{metadata.get('name', recording_id)}' deleted",
+            "id": recording_id
+        })
+    
+    @app.route("/v1/recordings/<recording_id>", methods=["PATCH"])
+    def update_recording(recording_id):
+        """Update recording metadata (e.g., rename)."""
+        meta_path = recordings_dir / f"{recording_id}.json"
+        if not meta_path.exists():
+            return jsonify({"error": "Recording not found"}), 404
+        
+        try:
+            with open(meta_path, 'r') as f:
+                metadata = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return jsonify({"error": "Invalid recording metadata"}), 500
+        
+        # Update allowed fields
+        data = request.get_json() or {}
+        if "name" in data:
+            metadata["name"] = data["name"]
+        
+        with open(meta_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        return jsonify({
+            "message": "Recording updated",
+            "recording": metadata
+        })
     
     @app.route("/health", methods=["GET"])
     def health():

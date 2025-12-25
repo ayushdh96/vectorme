@@ -520,6 +520,136 @@
                 flex: none;
             }
         }
+
+        /* Saved Recordings Styles */
+        .recordings-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .recording-item {
+            display: flex;
+            align-items: center;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            transition: all 0.2s ease;
+            gap: 12px;
+        }
+        .recording-item:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+        .recording-icon {
+            font-size: 24px;
+            opacity: 0.7;
+        }
+        .recording-info {
+            flex: 1;
+            min-width: 0;
+        }
+        .recording-name {
+            font-weight: 600;
+            font-size: 14px;
+            color: #fff;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .recording-meta {
+            font-size: 12px;
+            color: #888;
+            display: flex;
+            gap: 12px;
+            margin-top: 4px;
+        }
+        .recording-actions {
+            display: flex;
+            gap: 8px;
+        }
+        .btn-small {
+            padding: 6px 12px;
+            font-size: 12px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .btn-load {
+            background: linear-gradient(135deg, #11998e, #38ef7d);
+            color: white;
+        }
+        .btn-load:hover {
+            transform: scale(1.05);
+            box-shadow: 0 2px 10px rgba(56, 239, 125, 0.3);
+        }
+        .btn-delete {
+            background: rgba(255, 65, 108, 0.2);
+            color: #ff6b8a;
+        }
+        .btn-delete:hover {
+            background: rgba(255, 65, 108, 0.4);
+        }
+        .btn-save {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+        }
+        .btn-save:hover:not(:disabled) {
+            transform: scale(1.05);
+            box-shadow: 0 4px 20px rgba(102, 126, 234, 0.4);
+        }
+        .empty-state {
+            text-align: center;
+            padding: 24px;
+            color: #666;
+            font-size: 14px;
+        }
+        .save-recording-form {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 16px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .save-recording-form input {
+            flex: 1;
+            padding: 10px 12px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.3);
+            color: #fff;
+            font-size: 14px;
+        }
+        .save-recording-form input:focus {
+            outline: none;
+            border-color: #4a9eff;
+        }
+        .card-title-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px;
+        }
+        .card-title-row h3 {
+            margin: 0;
+        }
+        .btn-refresh {
+            background: rgba(255, 255, 255, 0.1);
+            color: #888;
+            padding: 6px 10px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s ease;
+        }
+        .btn-refresh:hover {
+            background: rgba(255, 255, 255, 0.2);
+            color: #fff;
+        }
     </style>
 </head>
 <body>
@@ -565,6 +695,12 @@
             const [selectedExistingSpeaker, setSelectedExistingSpeaker] = useState(null);
             const [isSaving, setIsSaving] = useState(false);
             const [knownSpeakers, setKnownSpeakers] = useState([]);
+            
+            // Saved recordings state
+            const [savedRecordings, setSavedRecordings] = useState([]);
+            const [recordingName, setRecordingName] = useState('');
+            const [isSavingRecording, setIsSavingRecording] = useState(false);
+            const [isLoadingRecording, setIsLoadingRecording] = useState(false);
 
             const waveformRef = useRef(null);
             const playbackWaveformRef = useRef(null);
@@ -981,6 +1117,136 @@
                     .then(data => setKnownSpeakers(data.speakers || []))
                     .catch(err => console.error('Error fetching speakers:', err));
             }, []);
+            
+            // Fetch saved recordings on mount
+            const fetchRecordings = useCallback(() => {
+                fetch('/v1/recordings')
+                    .then(res => res.json())
+                    .then(data => setSavedRecordings(data.recordings || []))
+                    .catch(err => console.error('Error fetching recordings:', err));
+            }, []);
+            
+            useEffect(() => {
+                fetchRecordings();
+            }, [fetchRecordings]);
+            
+            // Save current recording
+            const saveRecording = useCallback(async () => {
+                if (!audioBlob || isSavingRecording) return;
+                
+                setIsSavingRecording(true);
+                try {
+                    const formData = new FormData();
+                    formData.append('file', audioBlob, 'recording.webm');
+                    formData.append('name', recordingName.trim() || `Recording ${new Date().toLocaleString()}`);
+                    formData.append('duration', duration.toString());
+                    
+                    const response = await fetch('/v1/recordings', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    if (!response.ok) {
+                        const error = await response.json();
+                        throw new Error(error.error || 'Failed to save recording');
+                    }
+                    
+                    const result = await response.json();
+                    console.log('Recording saved:', result);
+                    
+                    // Refresh recordings list
+                    fetchRecordings();
+                    setRecordingName('');
+                } catch (error) {
+                    console.error('Error saving recording:', error);
+                    alert('Error saving recording: ' + error.message);
+                } finally {
+                    setIsSavingRecording(false);
+                }
+            }, [audioBlob, recordingName, duration, fetchRecordings, isSavingRecording]);
+            
+            // Load a saved recording
+            const loadRecording = useCallback(async (recording) => {
+                if (isLoadingRecording || isRecording) return;
+                
+                setIsLoadingRecording(true);
+                setStatus('processing');
+                setStatusText(`Loading "${recording.name}"...`);
+                
+                try {
+                    // Fetch the audio file
+                    const response = await fetch(`/v1/recordings/${recording.id}`);
+                    if (!response.ok) {
+                        throw new Error('Failed to fetch recording');
+                    }
+                    
+                    const blob = await response.blob();
+                    
+                    // Clear previous state
+                    setSegments([]);
+                    setEvents([]);
+                    setSpeakers([]);
+                    speakerMap.clear();
+                    setActiveSegment(null);
+                    activeSegmentRef.current = null;
+                    
+                    // Cleanup previous playback wavesurfer
+                    if (playbackWavesurferRef.current) {
+                        playbackWavesurferRef.current.destroy();
+                        playbackWavesurferRef.current = null;
+                    }
+                    
+                    // Set the audio blob (this will trigger playback waveform creation)
+                    setAudioBlob(blob);
+                    
+                    // Process diarization
+                    await processStreamingDiarization(blob, false);
+                    
+                } catch (error) {
+                    console.error('Error loading recording:', error);
+                    setStatus('ready');
+                    setStatusText('Error loading recording');
+                } finally {
+                    setIsLoadingRecording(false);
+                }
+            }, [isLoadingRecording, isRecording, processStreamingDiarization, speakerMap]);
+            
+            // Delete a saved recording
+            const deleteRecording = useCallback(async (recording, e) => {
+                e.stopPropagation();
+                
+                if (!confirm(`Delete "${recording.name}"?`)) return;
+                
+                try {
+                    const response = await fetch(`/v1/recordings/${recording.id}`, {
+                        method: 'DELETE'
+                    });
+                    
+                    if (!response.ok) {
+                        const error = await response.json();
+                        throw new Error(error.error || 'Failed to delete recording');
+                    }
+                    
+                    // Refresh recordings list
+                    fetchRecordings();
+                } catch (error) {
+                    console.error('Error deleting recording:', error);
+                    alert('Error deleting recording: ' + error.message);
+                }
+            }, [fetchRecordings]);
+            
+            // Format file size
+            const formatSize = (bytes) => {
+                if (bytes < 1024) return bytes + ' B';
+                if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+                return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+            };
+            
+            // Format date
+            const formatDate = (isoString) => {
+                const date = new Date(isoString);
+                return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            };
 
             const openNamingModal = useCallback((segment, e) => {
                 e.stopPropagation();
@@ -1127,6 +1393,28 @@
                                     disabled={!playbackWavesurferRef.current}
                                 >
                                     {isPlaying ? '⏸️ Pause' : '▶️ Play'}
+                                </button>
+                            </div>
+                            
+                            {/* Save Recording Form */}
+                            <div className="save-recording-form" style={{ marginTop: '16px' }}>
+                                <input
+                                    type="text"
+                                    placeholder="Name this recording..."
+                                    value={recordingName}
+                                    onChange={(e) => setRecordingName(e.target.value)}
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter') saveRecording();
+                                    }}
+                                    aria-label="Recording name"
+                                />
+                                <button
+                                    className="btn-save"
+                                    onClick={saveRecording}
+                                    disabled={isSavingRecording}
+                                    title="Save recording for later analysis"
+                                >
+                                    {isSavingRecording ? '💾 Saving...' : '💾 Save'}
                                 </button>
                             </div>
                         </div>
@@ -1344,6 +1632,77 @@
                             </div>
                         </div>
                     )}
+                    
+                    {/* Saved Recordings Section */}
+                    <div className="card">
+                        <div className="card-title-row">
+                            <h3>📁 Saved Recordings</h3>
+                            <button 
+                                className="btn-refresh" 
+                                onClick={fetchRecordings}
+                                title="Refresh recordings list"
+                                aria-label="Refresh recordings list"
+                            >
+                                🔄
+                            </button>
+                        </div>
+                        
+                        {savedRecordings.length === 0 ? (
+                            <div className="empty-state">
+                                No saved recordings yet. Record audio and click Save to keep it for later analysis.
+                            </div>
+                        ) : (
+                            <div className="recordings-list">
+                                {savedRecordings.map((recording) => (
+                                    <div 
+                                        key={recording.id} 
+                                        className="recording-item"
+                                        onClick={() => loadRecording(recording)}
+                                        style={{ cursor: isLoadingRecording ? 'wait' : 'pointer' }}
+                                        role="button"
+                                        tabIndex={0}
+                                        aria-label={`Load recording: ${recording.name}`}
+                                        onKeyDown={(e) => {
+                                            if (e.key === 'Enter' || e.key === ' ') {
+                                                e.preventDefault();
+                                                loadRecording(recording);
+                                            }
+                                        }}
+                                    >
+                                        <span className="recording-icon">🎵</span>
+                                        <div className="recording-info">
+                                            <div className="recording-name">{recording.name}</div>
+                                            <div className="recording-meta">
+                                                <span>{formatDate(recording.timestamp)}</span>
+                                                <span>{recording.duration > 0 ? formatTime(recording.duration) : '--'}</span>
+                                                <span>{formatSize(recording.size)}</span>
+                                            </div>
+                                        </div>
+                                        <div className="recording-actions">
+                                            <button
+                                                className="btn-small btn-load"
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    loadRecording(recording);
+                                                }}
+                                                disabled={isLoadingRecording || isRecording}
+                                                aria-label={`Load ${recording.name}`}
+                                            >
+                                                ▶️ Load
+                                            </button>
+                                            <button
+                                                className="btn-small btn-delete"
+                                                onClick={(e) => deleteRecording(recording, e)}
+                                                aria-label={`Delete ${recording.name}`}
+                                            >
+                                                🗑️
+                                            </button>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
                 </div>
             );
         }
