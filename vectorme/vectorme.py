@@ -392,7 +392,7 @@ def process_chunks(args, classifier, torchaudio, torch, db, vad=None):
 
 
 def diarize_audio_bytes(audio_bytes, classifier, torchaudio, torch, db,
-                        chunk_size=2.0, chunk_hop=0.5, threshold=0.5, change_threshold=0.7,
+                        chunk_size=3.0, chunk_hop=0.5, threshold=0.5, change_threshold=0.7,
                         filter_unknown=False):
     """Process audio bytes and return diarization results."""
     temp_input = None
@@ -693,7 +693,7 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
         audio_bytes = file.read()
         
         response_format = request.form.get("response_format", "json")
-        chunk_size = float(request.form.get("chunk_size", 2.0))
+        chunk_size = float(request.form.get("chunk_size", 3.0))
         chunk_hop = float(request.form.get("chunk_hop", 0.5))
         threshold = float(request.form.get("threshold", 0.5))
         change_threshold = float(request.form.get("change_threshold", 0.7))
@@ -1346,8 +1346,8 @@ def main():
     parser.add_argument(
         "--chunk-size",
         type=float,
-        default=2.0,
-        help="Chunk duration in seconds for diarization (default: 2.0)"
+        default=3.0,
+        help="Chunk duration in seconds for diarization (default: 3.0, matches ECAPA-TDNN training)"
     )
     parser.add_argument(
         "--chunk-hop",

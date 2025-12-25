@@ -116,7 +116,7 @@ vectorme --file audio.m4a --diarize --vad-threshold 0.3
 **Tuning parameters:**
 ```bash
 vectorme --file audio.m4a --diarize \
-  --chunk-size 2.0 \      # Chunk duration in seconds (default: 2.0)
+  --chunk-size 3.0 \      # Chunk duration in seconds (default: 3.0, matches training)
   --chunk-hop 0.5 \       # Hop between chunks (default: 0.5)
   --threshold 0.5 \       # Minimum similarity to identify speaker (default: 0.5)
   --change-threshold 0.7 \# Threshold for speaker change detection (default: 0.7)
@@ -230,7 +230,7 @@ Real-time NDJSON output:
 ```
 
 **Additional parameters:**
-- `chunk_size` - Chunk duration in seconds (default: 2.0)
+- `chunk_size` - Chunk duration in seconds (default: 3.0, matches ECAPA-TDNN training)
 - `chunk_hop` - Hop between chunks (default: 0.5)
 - `threshold` - Minimum similarity to identify speaker (default: 0.5)
 - `change_threshold` - Speaker change detection threshold (default: 0.7)
@@ -246,3 +246,16 @@ ECAPA-TDNN produces 192-dimensional speaker embeddings that can be used for:
 - Speaker clustering (group audio by speaker)
 
 The model is trained on VoxCeleb dataset and downloaded from SpeechBrain's model hub.
+
+### Training Segment Size
+
+The pretrained `speechbrain/spkrec-ecapa-voxceleb` model was trained on **fixed-length 3.0 second audio crops** at 16kHz (48,000 samples). This has important implications:
+
+- **Chunk size**: We default to 3.0s chunks to match training conditions
+- **Shorter segments**: Segments much shorter than 3s produce noisier, less stable embeddings
+- **Longer segments**: The model supports variable-length input via attentive statistical pooling, but if multiple speakers are present in one segment, the embedding will be a "blend" of all speakers
+- **Best practice for enrollment**: Use 3-10 seconds of single-speaker audio when adding speakers to the database
+
+References:
+- [SpeechBrain ECAPA recipe](https://github.com/speechbrain/speechbrain/blob/develop/recipes/VoxCeleb/SpeakerRec/hparams/train_ecapa_tdnn.yaml)
+- [Model card](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb)
