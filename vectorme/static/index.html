@@ -324,6 +324,10 @@
             const processingRef = useRef(false);
             const lastProcessedChunkRef = useRef(0);
             const activeSegmentRef = useRef(null);
+            const canvasRef = useRef(null);
+            const audioContextRef = useRef(null);
+            const analyserRef = useRef(null);
+            const animationRef = useRef(null);
 
             // Initialize recording waveform
             useEffect(() => {
@@ -465,33 +469,75 @@
 
                     // Start live visualization using AudioContext
                     const audioContext = new AudioContext();
+                    audioContextRef.current = audioContext;
                     const source = audioContext.createMediaStreamSource(stream);
                     const analyser = audioContext.createAnalyser();
+                    analyserRef.current = analyser;
                     analyser.fftSize = 2048;
                     source.connect(analyser);
 
                     const bufferLength = analyser.frequencyBinCount;
                     const dataArray = new Uint8Array(bufferLength);
 
-                    const updateWaveform = () => {
-                        if (!isRecording && !mediaRecorderRef.current?.state === 'recording') return;
+                    const drawWaveform = () => {
+                        if (mediaRecorderRef.current?.state !== 'recording') {
+                            animationRef.current = null;
+                            return;
+                        }
+                        
+                        animationRef.current = requestAnimationFrame(drawWaveform);
+                        
+                        const canvas = canvasRef.current;
+                        if (!canvas) return;
+                        
+                        const ctx = canvas.getContext('2d');
+                        const width = canvas.width;
+                        const height = canvas.height;
                         
                         analyser.getByteTimeDomainData(dataArray);
                         
-                        // Create a simple visualization
-                        if (wavesurferRef.current) {
-                            // We'll update the container background to show activity
-                            const average = dataArray.reduce((a, b) => a + Math.abs(b - 128), 0) / bufferLength;
-                            const intensity = Math.min(average / 50, 1);
-                            waveformRef.current.style.boxShadow = `inset 0 0 ${20 + intensity * 30}px rgba(74, 158, 255, ${intensity * 0.5})`;
+                        // Clear canvas
+                        ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+                        ctx.fillRect(0, 0, width, height);
+                        
+                        // Draw waveform
+                        ctx.lineWidth = 2;
+                        ctx.strokeStyle = '#4a9eff';
+                        ctx.beginPath();
+                        
+                        const sliceWidth = width / bufferLength;
+                        let x = 0;
+                        
+                        for (let i = 0; i < bufferLength; i++) {
+                            const v = dataArray[i] / 128.0;
+                            const y = (v * height) / 2;
+                            
+                            if (i === 0) {
+                                ctx.moveTo(x, y);
+                            } else {
+                                ctx.lineTo(x, y);
+                            }
+                            x += sliceWidth;
                         }
                         
-                        if (mediaRecorderRef.current?.state === 'recording') {
-                            requestAnimationFrame(updateWaveform);
-                        }
+                        ctx.lineTo(width, height / 2);
+                        ctx.stroke();
+                        
+                        // Draw center line
+                        ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+                        ctx.lineWidth = 1;
+                        ctx.beginPath();
+                        ctx.moveTo(0, height / 2);
+                        ctx.lineTo(width, height / 2);
+                        ctx.stroke();
+                        
+                        // Add glow effect based on intensity
+                        const average = dataArray.reduce((a, b) => a + Math.abs(b - 128), 0) / bufferLength;
+                        const intensity = Math.min(average / 50, 1);
+                        waveformRef.current.style.boxShadow = `inset 0 0 ${20 + intensity * 30}px rgba(74, 158, 255, ${intensity * 0.5})`;
                     };
                     
-                    updateWaveform();
+                    drawWaveform();
 
                 } catch (error) {
                     console.error('Error starting recording:', error);
@@ -507,6 +553,16 @@
                 if (streamRef.current) {
                     streamRef.current.getTracks().forEach(track => track.stop());
                     streamRef.current = null;
+                }
+                // Cancel animation frame
+                if (animationRef.current) {
+                    cancelAnimationFrame(animationRef.current);
+                    animationRef.current = null;
+                }
+                // Close audio context
+                if (audioContextRef.current) {
+                    audioContextRef.current.close();
+                    audioContextRef.current = null;
                 }
                 setIsRecording(false);
                 setStatus('processing');
@@ -653,7 +709,14 @@
                         </div>
 
                         <div className="waveform-container" ref={waveformRef}>
-                            {!isRecording && !audioBlob && (
+                            {isRecording ? (
+                                <canvas 
+                                    ref={canvasRef} 
+                                    width={800} 
+                                    height={80}
+                                    style={{ width: '100%', height: '80px', borderRadius: '8px' }}
+                                />
+                            ) : !audioBlob ? (
                                 <div style={{ 
                                     height: '80px', 
                                     display: 'flex', 
@@ -663,7 +726,7 @@
                                 }}>
                                     Click Record to start
                                 </div>
-                            )}
+                            ) : null}
                         </div>
 
                         <div className="controls">
