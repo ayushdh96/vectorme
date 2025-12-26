@@ -4,6 +4,9 @@ A command-line tool and HTTP server for speaker identification and diarization u
 
 <img width="400" alt="screenshot" src="https://github.com/user-attachments/assets/3e5a2459-4afe-4b0d-ac87-93a568d78ad5" />
 
+Watch a video: https://youtu.be/-kvUzvcfD6o
+
+
 ## Features
 
 - **Speaker Embeddings**: Extract 192-dimensional speaker embeddings
