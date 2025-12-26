@@ -604,6 +604,21 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
         temp_input = None
         temp_wav = None
         
+        # Dynamic threshold based on VAD confidence
+        # High VAD = confident speech, so we can trust lower similarity matches
+        def get_effective_threshold(segment_vad, base_threshold):
+            if segment_vad is None:
+                return base_threshold
+            if segment_vad >= 0.7:
+                # High VAD confidence - speech is clear, lower threshold
+                return max(0.35, base_threshold - 0.15)
+            elif segment_vad >= 0.5:
+                # Medium VAD - moderate adjustment
+                return max(0.40, base_threshold - 0.10)
+            else:
+                # Lower VAD - use base threshold
+                return base_threshold
+        
         try:
             # Write bytes to temp file
             temp_fd, temp_input = tempfile.mkstemp()
@@ -639,10 +654,23 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
             # Get VAD if enabled
             vad = get_vad(vad_threshold) if use_vad else None
             
-            prev_embedding = None
+            # Minimum VAD confidence required to attempt speaker identification
+            # Segments below this are likely noise/silence and shouldn't be identified
+            min_vad_for_identification = 0.4
+            
+            # Accumulated embedding for current segment (more accurate than single chunk)
+            # Weight embeddings by VAD confidence so noise contributes less
+            accumulated_embedding = None
+            accumulated_weight = 0.0
+            # Also track the best embedding (highest VAD) for speaker identification
+            best_embedding = None
+            best_embedding_vad = 0.0
             prev_speaker = None
             prev_vad_confidence = None
             segment_start = 0.0
+            # Track consecutive silent chunks - only close segment after sustained silence
+            consecutive_silent_chunks = 0
+            min_silent_chunks_to_close = 2  # Require ~1 second of silence (2 chunks at 0.5s hop)
             
             position = 0
             while position < total_samples:
@@ -660,25 +688,58 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                 if vad is not None:
                     has_speech, vad_confidence, vad_speech_ratio = vad.get_speech_confidence(chunk, sample_rate)
                     if not has_speech:
-                        # No speech detected
-                        if prev_speaker is not None:
-                            # Emit previous segment before silence
-                            if segment_start < current_time:
-                                if not filter_unknown or prev_speaker is not None:
-                                    yield json.dumps({
-                                        "event": "segment",
-                                        "start": round(segment_start, 2),
-                                        "end": round(current_time, 2),
-                                        "speaker": prev_speaker,
-                                        "vad_confidence": round(prev_vad_confidence, 3) if prev_vad_confidence else None
-                                    }) + "\n"
-                            prev_speaker = None
-                            prev_embedding = None
-                            prev_vad_confidence = None
-                        # Don't update segment_start here - we'll set it when speech resumes
-                        segment_start = None  # Mark that we're in silence
+                        consecutive_silent_chunks += 1
+                        # Only close segment after sustained silence (prevents gaps from breaking segments)
+                        if consecutive_silent_chunks >= min_silent_chunks_to_close:
+                            # Sustained silence - emit segment if we had one
+                            if segment_start is not None and segment_start < current_time:
+                                # Extract embedding from the full segment audio for accurate identification
+                                segment_start_sample = int(segment_start * sample_rate)
+                                segment_end_sample = int(current_time * sample_rate)
+                                segment_waveform = waveform[:, segment_start_sample:segment_end_sample]
+                                
+                                final_speaker = None
+                                # Compute VAD for the full segment (more accurate than running average)
+                                if segment_waveform.shape[1] >= sample_rate * 0.5:
+                                    _, segment_vad, _ = vad.get_speech_confidence(segment_waveform, sample_rate)
+                                else:
+                                    segment_vad = prev_vad_confidence if prev_vad_confidence is not None else 0.0
+                                
+                                # Skip segment entirely if VAD is too low (just noise/silence, not speech)
+                                if segment_vad < min_vad_for_identification:
+                                    # Don't emit segment - it's just noise
+                                    pass
+                                else:
+                                    # Only try to identify speaker if VAD is high enough
+                                    if segment_waveform.shape[1] >= sample_rate * 0.5 and len(db) > 0:
+                                        with torch.no_grad():
+                                            full_segment_embedding = classifier.encode_batch(segment_waveform)
+                                            full_segment_embedding = full_segment_embedding.squeeze().cpu().numpy()
+                                        results = db.query(full_segment_embedding, top_k=1)
+                                        # Use dynamic threshold - high VAD = confident speech = lower threshold
+                                        effective_threshold = get_effective_threshold(segment_vad, threshold)
+                                        final_speaker = results[0]["name"] if results and results[0]["similarity"] > effective_threshold else None
+                                    
+                                    if not filter_unknown or final_speaker is not None:
+                                        yield json.dumps({
+                                            "event": "segment",
+                                            "start": round(segment_start, 2),
+                                            "end": round(current_time, 2),
+                                            "speaker": final_speaker,
+                                            "vad_confidence": round(segment_vad, 3)
+                                        }) + "\n"
+                                accumulated_embedding = None
+                                accumulated_weight = 0.0
+                                best_embedding = None
+                                best_embedding_vad = 0.0
+                                prev_speaker = None
+                                prev_vad_confidence = None
+                            segment_start = None  # Mark that we're in silence
                         position += hop_samples
                         continue
+                
+                # Speech detected - reset silent chunk counter
+                consecutive_silent_chunks = 0
                 
                 # If we were in silence and speech resumed, update segment_start
                 if segment_start is None:
@@ -689,39 +750,83 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                     embedding = classifier.encode_batch(chunk)
                     embedding = embedding.squeeze().cpu().numpy()
                 
-                if len(db) > 0:
-                    results = db.query(embedding, top_k=1)
-                    current_speaker = results[0]["name"] if results and results[0]["similarity"] > threshold else None
-                    current_similarity = results[0]["similarity"] if results else 0.0
-                else:
-                    current_speaker = None
-                    current_similarity = 0.0
-                
+                # Check if this embedding is similar to accumulated (same speaker continuing)
+                # or radically different (speaker change)
+                # Only consider speaker change if VAD confidence is high enough (clear speech)
                 speaker_changed = False
-                if prev_embedding is not None:
-                    similarity = cosine_similarity(prev_embedding, embedding)
-                    if similarity < change_threshold or current_speaker != prev_speaker:
+                min_vad_for_change = 0.5  # Minimum VAD to consider a speaker change
+                if accumulated_embedding is not None:
+                    similarity_to_accumulated = cosine_similarity(accumulated_embedding, embedding)
+                    # Only trigger speaker change if:
+                    # 1. Embedding is radically different AND
+                    # 2. Current chunk has high enough VAD (not noise)
+                    current_vad = vad_confidence if vad_confidence is not None else 0.5
+                    if similarity_to_accumulated < change_threshold and current_vad >= min_vad_for_change:
+                        # Radically different with clear speech - speaker change
                         speaker_changed = True
                 else:
+                    # First chunk of a new segment
                     speaker_changed = True
                 
                 if speaker_changed:
-                    # Emit previous segment
+                    # Emit previous segment - extract embedding from FULL segment audio for accurate identification
                     if segment_start is not None and segment_start < current_time:
-                        if not filter_unknown or prev_speaker is not None:
-                            segment_data = {
-                                "event": "segment",
-                                "start": round(segment_start, 2),
-                                "end": round(current_time, 2),
-                                "speaker": prev_speaker
-                            }
-                            if prev_vad_confidence is not None:
-                                segment_data["vad_confidence"] = round(prev_vad_confidence, 3)
-                            yield json.dumps(segment_data) + "\n"
+                        # Extract embedding from the full segment (not just best chunk)
+                        segment_start_sample = int(segment_start * sample_rate)
+                        segment_end_sample = int(current_time * sample_rate)
+                        segment_waveform = waveform[:, segment_start_sample:segment_end_sample]
+                        
+                        final_speaker = None
+                        final_similarity = 0.0
+                        # Compute VAD for the full segment (more accurate than running average)
+                        if vad is not None and segment_waveform.shape[1] >= sample_rate * 0.5:
+                            _, segment_vad, _ = vad.get_speech_confidence(segment_waveform, sample_rate)
+                        else:
+                            segment_vad = prev_vad_confidence if prev_vad_confidence is not None else 0.0
+                        # Only try to identify speaker if VAD is high enough
+                        if segment_vad >= min_vad_for_identification and segment_waveform.shape[1] >= sample_rate * 0.5 and len(db) > 0:
+                            with torch.no_grad():
+                                full_segment_embedding = classifier.encode_batch(segment_waveform)
+                                full_segment_embedding = full_segment_embedding.squeeze().cpu().numpy()
+                            results = db.query(full_segment_embedding, top_k=1)
+                            # Use dynamic threshold - high VAD = confident speech = lower threshold
+                            effective_threshold = get_effective_threshold(segment_vad, threshold)
+                            final_speaker = results[0]["name"] if results and results[0]["similarity"] > effective_threshold else None
+                            final_similarity = results[0]["similarity"] if results else 0.0
+                        
+                        # Skip segment entirely if VAD is too low (just noise/silence)
+                        if segment_vad >= min_vad_for_identification:
+                            if not filter_unknown or final_speaker is not None:
+                                segment_data = {
+                                    "event": "segment",
+                                    "start": round(segment_start, 2),
+                                    "end": round(current_time, 2),
+                                    "speaker": final_speaker
+                                }
+                                if prev_vad_confidence is not None:
+                                    segment_data["vad_confidence"] = round(prev_vad_confidence, 3)
+                                yield json.dumps(segment_data) + "\n"
                     
+                    # Start new segment with this embedding (weighted by VAD confidence)
                     segment_start = current_time
-                    prev_speaker = current_speaker
+                    accumulated_embedding = embedding.copy()
+                    accumulated_weight = vad_confidence if vad_confidence is not None else 0.5
+                    # Reset best embedding tracking
+                    current_vad_val = vad_confidence if vad_confidence is not None else 0.5
+                    best_embedding = embedding.copy()
+                    best_embedding_vad = current_vad_val
                     prev_vad_confidence = vad_confidence
+                    
+                    # Identify speaker for this new chunk
+                    if len(db) > 0:
+                        results = db.query(embedding, top_k=1)
+                        current_speaker = results[0]["name"] if results and results[0]["similarity"] > threshold else None
+                        current_similarity = results[0]["similarity"] if results else 0.0
+                    else:
+                        current_speaker = None
+                        current_similarity = 0.0
+                    
+                    prev_speaker = current_speaker
                     
                     # Emit speaker change event
                     change_data = {
@@ -734,27 +839,66 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                         change_data["vad_confidence"] = round(vad_confidence, 3)
                     yield json.dumps(change_data) + "\n"
                 else:
+                    # Similar to accumulated - merge this embedding weighted by VAD confidence
+                    # High VAD = clear speech = more weight; Low VAD = noise = less weight
+                    chunk_weight = vad_confidence if vad_confidence is not None else 0.5
+                    accumulated_weight += chunk_weight
+                    
+                    # Weighted running average: weight by VAD confidence
+                    if accumulated_weight > 0:
+                        blend = chunk_weight / accumulated_weight
+                        accumulated_embedding = (1 - blend) * accumulated_embedding + blend * embedding
+                        # Normalize to unit length for cosine similarity
+                        accumulated_embedding = accumulated_embedding / np.linalg.norm(accumulated_embedding)
+                    
+                    # Track the best embedding (highest VAD) for speaker identification
+                    current_vad_val = vad_confidence if vad_confidence is not None else 0.5
+                    if current_vad_val > best_embedding_vad:
+                        best_embedding = embedding.copy()
+                        best_embedding_vad = current_vad_val
+                    
                     # Track running average of VAD confidence for the segment
                     if vad_confidence is not None and prev_vad_confidence is not None:
                         prev_vad_confidence = (prev_vad_confidence + vad_confidence) / 2
                     elif vad_confidence is not None:
                         prev_vad_confidence = vad_confidence
                 
-                prev_embedding = embedding
                 position += hop_samples
             
-            # Final segment
+            # Final segment - extract embedding from full segment audio for accurate identification
             if segment_start is not None and segment_start < duration:
-                if not filter_unknown or prev_speaker is not None:
-                    segment_data = {
-                        "event": "segment",
-                        "start": round(segment_start, 2),
-                        "end": round(duration, 2),
-                        "speaker": prev_speaker
-                    }
-                    if prev_vad_confidence is not None:
-                        segment_data["vad_confidence"] = round(prev_vad_confidence, 3)
-                    yield json.dumps(segment_data) + "\n"
+                segment_start_sample = int(segment_start * sample_rate)
+                segment_waveform = waveform[:, segment_start_sample:]
+                
+                final_speaker = None
+                # Compute VAD for the full segment (more accurate than running average)
+                if vad is not None and segment_waveform.shape[1] >= sample_rate * 0.5:
+                    _, segment_vad, _ = vad.get_speech_confidence(segment_waveform, sample_rate)
+                else:
+                    segment_vad = prev_vad_confidence if prev_vad_confidence is not None else 0.0
+                
+                # Skip segment entirely if VAD is too low (just noise/silence)
+                if segment_vad >= min_vad_for_identification:
+                    # Only try to identify speaker if VAD is high enough
+                    if segment_waveform.shape[1] >= sample_rate * 0.5 and len(db) > 0:
+                        with torch.no_grad():
+                            full_segment_embedding = classifier.encode_batch(segment_waveform)
+                            full_segment_embedding = full_segment_embedding.squeeze().cpu().numpy()
+                        results = db.query(full_segment_embedding, top_k=1)
+                        # Use dynamic threshold - high VAD = confident speech = lower threshold
+                        effective_threshold = get_effective_threshold(segment_vad, threshold)
+                        final_speaker = results[0]["name"] if results and results[0]["similarity"] > effective_threshold else None
+                    
+                    if not filter_unknown or final_speaker is not None:
+                        segment_data = {
+                            "event": "segment",
+                            "start": round(segment_start, 2),
+                            "end": round(duration, 2),
+                            "speaker": final_speaker
+                        }
+                        if prev_vad_confidence is not None:
+                            segment_data["vad_confidence"] = round(prev_vad_confidence, 3)
+                        yield json.dumps(segment_data) + "\n"
             
             yield json.dumps({"event": "done"}) + "\n"
             
