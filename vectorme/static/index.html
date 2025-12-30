@@ -991,8 +991,8 @@
                             // Final diarization with complete audio (coarse streaming)
                             await processStreamingDiarization(blob, false);
 
-                            // Run TS-VAD refinement pass (optional - comment out if causing issues)
-                            // await processRefinedDiarization(blob);
+                            //Run TS-VAD refinement pass (optional - comment out if causing issues)
+                            await processRefinedDiarization(blob);
                         } finally {
                             if (streamRef.current) {
                                 streamRef.current.getTracks().forEach(track => track.stop());
