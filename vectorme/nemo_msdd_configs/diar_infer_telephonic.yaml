@@ -49,8 +49,8 @@ diarizer:
     model_path: ecapa_tdnn
     parameters:
       # Multi-scale embeddings required for MSDD to work properly
-      window_length_in_sec: [1.5, 1.25, 1.0, 0.75, 0.5]
-      shift_length_in_sec: [0.75, 0.625, 0.5, 0.375, 0.25]
+      window_length_in_sec: [2.0, 1.25, 1.0, 0.75, 0.5]
+      shift_length_in_sec: [0.5, 0.5, 0.5, 0.375, 0.25]
       multiscale_weights: [1.0, 1.0, 1.0, 1.0, 1.0]
       # MUST be true for MSDD.
       save_embeddings: True
@@ -77,11 +77,11 @@ diarizer:
     parameters:
       use_speaker_model_from_ckpt: True
       infer_batch_size: 25
-      sigmoid_threshold: [0.6]
+      sigmoid_threshold: [0.60]
       seq_eval_mode: False
       split_infer: True
       diar_window_length: 50
-      overlap_infer_spk_limit: 5
+      overlap_infer_spk_limit: 0
 
   # -----------------
   # ASR (disabled)
