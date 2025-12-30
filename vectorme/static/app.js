@@ -932,21 +932,22 @@ function VoiceRecorder() {
             const result = await response.json();
             console.log('Speaker saved:', result);
             
-            // Update the segment with the new speaker name in both segment arrays
+            // Update ALL segments with the same speaker cluster label
+            const oldSpeakerLabel = namingSegment.speaker;
             setSegments(prev => prev.map(seg => 
-                seg.start === namingSegment.start && seg.end === namingSegment.end
+                seg.speaker === oldSpeakerLabel
                     ? { ...seg, speaker: speakerName }
                     : seg
             ));
             setRefinedSegments(prev => prev.map(seg => 
-                seg.start === namingSegment.start && seg.end === namingSegment.end
+                seg.speaker === oldSpeakerLabel
                     ? { ...seg, speaker: speakerName }
                     : seg
             ));
             
             // Remove from unknown speakers if it was an unknown cluster
-            if (namingSegment.speaker && namingSegment.speaker.startsWith('unknown_')) {
-                setUnknownSpeakers(prev => prev.filter(u => u !== namingSegment.speaker));
+            if (oldSpeakerLabel && oldSpeakerLabel.startsWith('unknown_')) {
+                setUnknownSpeakers(prev => prev.filter(u => u !== oldSpeakerLabel));
             }
             
             // Update known speakers list
