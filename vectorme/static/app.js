@@ -1412,7 +1412,10 @@ function VoiceRecorder() {
                             }}
                         >
                             {(() => {
-                                const allSegments = [...(refinedSegments || []), ...(segments || [])].filter(s => s);
+                                // Show only refined segments if available, otherwise show streaming segments
+                                const allSegments = (refinedSegments && refinedSegments.length > 0) 
+                                    ? refinedSegments 
+                                    : (segments || []);
                                 return allSegments.sort((a, b) => a.start - b.start).map((seg, i) => {
                                 const left = (seg.start / duration) * 100;
                                 const width = ((seg.end - seg.start) / duration) * 100;
@@ -1479,7 +1482,10 @@ function VoiceRecorder() {
 
                     <div className="diarization-results">
                         {(() => {
-                            const allSegments = [...(refinedSegments || []), ...(segments || [])].filter(s => s);
+                            // Show only refined segments if available, otherwise show streaming segments
+                            const allSegments = (refinedSegments && refinedSegments.length > 0) 
+                                ? refinedSegments 
+                                : (segments || []);
                             return allSegments.sort((a, b) => a.start - b.start).map((seg, i) => {
                             const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
                             const segKey = `${seg.start}-${seg.end}`;
