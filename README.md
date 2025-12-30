@@ -249,6 +249,73 @@ Real-time NDJSON output:
 - `vad=false` - Disable Voice Activity Detection (enabled by default)
 - `vad_threshold` - VAD speech probability threshold (default: 0.5)
 
+### TS-VAD Refined Diarization
+
+TS-VAD (Time-Stamped Voice Activity Detection) is an advanced diarization mode that provides more precise speaker boundaries and better unknown speaker clustering compared to the default streaming mode.
+
+**Key differences from streaming diarization:**
+- **Batch processing**: Analyzes the entire audio file instead of streaming chunks
+- **Sliding window**: Uses overlapping windows for smoother speaker transitions
+- **Unknown speaker clustering**: Groups unidentified segments into `unknown_1`, `unknown_2`, etc. based on voice similarity
+- **Precise timestamps**: More accurate speaker change boundaries
+
+**Enable TS-VAD mode:**
+```bash
+curl -X POST http://localhost:3120/v1/audio/transcriptions \
+  -F "file=@conversation.m4a" \
+  -F "response_format=diarized_json" \
+  -F "diarization_mode=ts_vad"
+```
+
+**TS-VAD-specific parameters:**
+- `diarization_mode=ts_vad` - Enable TS-VAD refinement (default: `streaming`)
+- `window_size` - Analysis window duration in seconds (default: 2.0)
+- `window_hop` - Hop between windows in seconds (default: 0.5)
+- `unknown_assign_threshold` - Similarity threshold for grouping unknown speakers (default: 0.60)
+- `min_segment_duration` - Minimum segment length in seconds (default: 0.5)
+
+**TS-VAD Response:**
+```json
+{
+  "mode": "ts_vad",
+  "duration": 59.07,
+  "segments": [
+    {"start": 0.0, "end": 3.2, "speaker": "Ayush", "similarity": 0.78, "vad_confidence": 0.91},
+    {"start": 3.2, "end": 7.5, "speaker": "unknown_1", "similarity": 0.42, "vad_confidence": 0.85},
+    {"start": 7.5, "end": 12.1, "speaker": "Doug", "similarity": 0.82, "vad_confidence": 0.89}
+  ],
+  "known_speakers": ["Ayush", "Doug"],
+  "unknown_speakers": ["unknown_1"],
+  "total_segments": 3
+}
+```
+
+**Unknown speaker handling:**
+- Segments with similarity below `threshold` (0.5) are marked as unknown
+- Unknown segments are clustered by voice similarity
+- Each cluster gets a unique ID: `unknown_1`, `unknown_2`, etc.
+- Similar-sounding unknowns are grouped together (controlled by `unknown_assign_threshold`)
+
+**Web UI features:**
+- Real-time speaker detection during recording with live waveform visualization
+- Confidence scores for each speaker identification
+- Color-coded similarity indicators (green ≥70%, yellow 50-69%, red <50%)
+- Speaker labeling interface for unknown speakers
+- Drag-to-select audio regions for focused analysis
+
+**CLI example with all parameters:**
+```bash
+curl -X POST http://localhost:3120/v1/audio/transcriptions \
+  -F "file=@meeting.m4a" \
+  -F "response_format=diarized_json" \
+  -F "diarization_mode=ts_vad" \
+  -F "window_size=2.0" \
+  -F "window_hop=0.5" \
+  -F "unknown_assign_threshold=0.60" \
+  -F "vad=true" \
+  -F "threshold=0.5"
+```
+
 ## About ECAPA-TDNN
 
 ECAPA-TDNN produces 192-dimensional speaker embeddings that can be used for:

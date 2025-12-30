@@ -557,6 +557,260 @@ def diarize_audio_bytes(audio_bytes, classifier, torchaudio, torch, db,
             os.unlink(temp_wav)
 
 
+def ts_vad_refine(audio_bytes, classifier, torchaudio, torch, db, vad=None,
+                   window_size=2.0, window_hop=0.5, identify_threshold=0.5,
+                   unknown_assign_threshold=0.60, min_segment_duration=0.5):
+    """TS-VAD-style refinement with sliding windows, unknown speaker clustering, and segment merging.
+    
+    Args:
+        audio_bytes: Raw audio data
+        classifier: ECAPA-TDNN classifier
+        torchaudio: torchaudio module
+        torch: torch module
+        db: VectorDB instance
+        vad: Optional SileroVAD instance
+        window_size: Window duration in seconds (default 2.0)
+        window_hop: Hop between windows in seconds (default 0.5)
+        identify_threshold: Cosine similarity threshold for known speaker match (default 0.5)
+        unknown_assign_threshold: Threshold for assigning to existing unknown cluster (default 0.60)
+        min_segment_duration: Minimum segment duration in seconds (default 0.5)
+    
+    Returns:
+        dict with mode, duration, segments, unknown_speakers, known_speakers
+    """
+    temp_input = None
+    temp_wav = None
+    
+    try:
+        # Write bytes to temp file
+        temp_fd, temp_input = tempfile.mkstemp()
+        os.write(temp_fd, audio_bytes)
+        os.close(temp_fd)
+        
+        # Convert through ffmpeg to 16kHz mono WAV
+        temp_fd2, temp_wav = tempfile.mkstemp(suffix='.wav')
+        os.close(temp_fd2)
+        
+        result = subprocess.run(
+            ['ffmpeg', '-i', temp_input, '-ar', '16000', '-ac', '1', '-y', temp_wav],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg conversion failed: {result.stderr}")
+        
+        waveform, sample_rate = torchaudio.load(temp_wav)
+        
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+        
+        total_samples = waveform.shape[1]
+        duration = total_samples / sample_rate
+        window_samples = int(window_size * sample_rate)
+        hop_samples = int(window_hop * sample_rate)
+        
+        # Track unknown speaker clusters: {"unknown_1": {"centroid": ndarray, "count": int, "embeddings": []}}
+        unknown_clusters = {}
+        unknown_counter = 0
+        
+        # Window-level labels: [(start_time, end_time, speaker_label, confidence, similarity, vad_confidence)]
+        window_labels = []
+        
+        position = 0
+        while position < total_samples:
+            end_pos = min(position + window_samples, total_samples)
+            window = waveform[:, position:end_pos]
+            
+            # Skip windows that are too short
+            if window.shape[1] < sample_rate * 0.5:
+                break
+            
+            window_start = position / sample_rate
+            window_end = end_pos / sample_rate
+            
+            # VAD check - skip non-speech windows if VAD enabled
+            vad_confidence = None
+            skip_window = False
+            if vad is not None:
+                try:
+                    has_speech, vad_confidence, vad_speech_ratio = vad.get_speech_confidence(window, sample_rate)
+                    # Use lower threshold to avoid skipping too many windows
+                    if not has_speech or vad_confidence < 0.3:
+                        skip_window = True
+                except Exception as e:
+                    # If VAD fails, process the window anyway
+                    skip_window = False
+                    vad_confidence = 0.5
+            
+            if not skip_window:
+                # Extract ECAPA embedding for this window
+                try:
+                    with torch.no_grad():
+                        embedding = classifier.encode_batch(window)
+                        embedding = embedding.squeeze().cpu().numpy()
+                except Exception as e:
+                    # Skip this window if embedding extraction fails
+                    position += hop_samples
+                    continue
+                
+                # Try to match against known speakers
+                speaker_label = None
+                similarity = 0.0
+                confidence = 0.0
+                
+                if len(db) > 0:
+                    matches = db.query(embedding, top_k=1)
+                    if matches and matches[0]["similarity"] >= identify_threshold:
+                        speaker_label = matches[0]["name"]
+                        similarity = matches[0]["similarity"]
+                        confidence = matches[0]["similarity"]
+                
+                # If no known match, assign to unknown cluster
+                if speaker_label is None:
+                    best_unknown_cluster = None
+                    best_unknown_similarity = 0.0
+                    
+                    # Check against existing unknown clusters
+                    for cluster_id, cluster_data in unknown_clusters.items():
+                        centroid = cluster_data["centroid"]
+                        sim = cosine_similarity(embedding, centroid)
+                        if sim > best_unknown_similarity:
+                            best_unknown_similarity = sim
+                            best_unknown_cluster = cluster_id
+                    
+                    # Assign to existing cluster if similarity >= threshold
+                    if best_unknown_cluster and best_unknown_similarity >= unknown_assign_threshold:
+                        speaker_label = best_unknown_cluster
+                        similarity = best_unknown_similarity
+                        confidence = best_unknown_similarity
+                        
+                        # Update cluster centroid (running average)
+                        cluster_data = unknown_clusters[best_unknown_cluster]
+                        cluster_data["embeddings"].append(embedding)
+                        cluster_data["count"] += 1
+                        # Recompute centroid as average of all embeddings
+                        cluster_data["centroid"] = np.mean(cluster_data["embeddings"], axis=0)
+                        # Normalize centroid for cosine similarity
+                        cluster_data["centroid"] = cluster_data["centroid"] / np.linalg.norm(cluster_data["centroid"])
+                    else:
+                        # Create new unknown cluster
+                        unknown_counter += 1
+                        cluster_id = f"unknown_{unknown_counter}"
+                        speaker_label = cluster_id
+                        similarity = 1.0  # Perfect match to itself
+                        confidence = 0.5  # Moderate confidence for unknown
+                        
+                        unknown_clusters[cluster_id] = {
+                            "centroid": embedding.copy(),
+                            "count": 1,
+                            "embeddings": [embedding.copy()]
+                        }
+                
+                # Record window label
+                window_labels.append((
+                    window_start,
+                    window_end,
+                    speaker_label,
+                    confidence,
+                    similarity,
+                    vad_confidence
+                ))
+            
+            position += hop_samples
+        
+        # Merge consecutive windows with same speaker into segments
+        segments = []
+        if window_labels:
+            current_segment_start = window_labels[0][0]
+            current_segment_speaker = window_labels[0][2]
+            current_segment_confidences = [window_labels[0][3]]
+            current_segment_similarities = [window_labels[0][4]]
+            current_segment_vad = [window_labels[0][5]] if window_labels[0][5] is not None else []
+            
+            for i in range(1, len(window_labels)):
+                win_start, win_end, speaker, conf, sim, vad_conf = window_labels[i]
+                
+                # Check if same speaker continues
+                if speaker == current_segment_speaker:
+                    # Merge into current segment
+                    current_segment_confidences.append(conf)
+                    current_segment_similarities.append(sim)
+                    if vad_conf is not None:
+                        current_segment_vad.append(vad_conf)
+                else:
+                    # Speaker changed - close previous segment
+                    segment_end = window_labels[i-1][1]
+                    segment_duration = segment_end - current_segment_start
+                    
+                    # Only add if meets minimum duration
+                    if segment_duration >= min_segment_duration:
+                        avg_confidence = float(np.mean(current_segment_confidences))
+                        avg_similarity = float(np.mean(current_segment_similarities))
+                        avg_vad = float(np.mean(current_segment_vad)) if current_segment_vad else None
+                        
+                        segment = {
+                            "start": round(current_segment_start, 2),
+                            "end": round(segment_end, 2),
+                            "speaker": current_segment_speaker,
+                            "cause": "ts_vad",
+                            "confidence": round(avg_confidence, 3),
+                            "similarity": round(avg_similarity, 3)
+                        }
+                        if avg_vad is not None:
+                            segment["vad_confidence"] = round(avg_vad, 3)
+                        
+                        segments.append(segment)
+                    
+                    # Start new segment
+                    current_segment_start = win_start
+                    current_segment_speaker = speaker
+                    current_segment_confidences = [conf]
+                    current_segment_similarities = [sim]
+                    current_segment_vad = [vad_conf] if vad_conf is not None else []
+            
+            # Close final segment
+            segment_end = window_labels[-1][1]
+            segment_duration = segment_end - current_segment_start
+            
+            if segment_duration >= min_segment_duration:
+                avg_confidence = float(np.mean(current_segment_confidences))
+                avg_similarity = float(np.mean(current_segment_similarities))
+                avg_vad = float(np.mean(current_segment_vad)) if current_segment_vad else None
+                
+                segment = {
+                    "start": round(current_segment_start, 2),
+                    "end": round(segment_end, 2),
+                    "speaker": current_segment_speaker,
+                    "cause": "ts_vad",
+                    "confidence": round(avg_confidence, 3),
+                    "similarity": round(avg_similarity, 3)
+                }
+                if avg_vad is not None:
+                    segment["vad_confidence"] = round(avg_vad, 3)
+                
+                segments.append(segment)
+        
+        # Extract unique speakers
+        unknown_speakers = sorted([s["speaker"] for s in segments if s["speaker"] and s["speaker"].startswith("unknown_")])
+        unknown_speakers = list(dict.fromkeys(unknown_speakers))  # Remove duplicates while preserving order
+        
+        known_speakers = db.list_names()
+        
+        return {
+            "mode": "ts_vad",
+            "duration": round(duration, 2),
+            "segments": segments,
+            "unknown_speakers": unknown_speakers,
+            "known_speakers": known_speakers
+        }
+        
+    finally:
+        if temp_input and os.path.exists(temp_input):
+            os.unlink(temp_input)
+        if temp_wav and os.path.exists(temp_wav):
+            os.unlink(temp_wav)
+
+
 def run_server(host, port, db_path, device="cpu", recordings_path=None):
     """Run HTTP server for audio diarization."""
     from flask import Flask, request, jsonify, Response, send_from_directory, send_file
@@ -606,9 +860,11 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
         
         # Dynamic threshold based on VAD confidence
         # High VAD = confident speech, so we can trust lower similarity matches
+        # When VAD is disabled (segment_vad is None), use a low default threshold
         def get_effective_threshold(segment_vad, base_threshold):
             if segment_vad is None:
-                return base_threshold
+                # VAD disabled - use a lower threshold to be more permissive
+                return max(0.40, base_threshold - 0.10)
             if segment_vad >= 0.7:
                 # High VAD confidence - speech is clear, lower threshold
                 return max(0.35, base_threshold - 0.15)
@@ -656,7 +912,7 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
             
             # Minimum VAD confidence required to attempt speaker identification
             # Segments below this are likely noise/silence and shouldn't be identified
-            min_vad_for_identification = 0.4
+            min_vad_for_identification = 0.1
             
             # Accumulated embedding for current segment (more accurate than single chunk)
             # Weight embeddings by VAD confidence so noise contributes less
@@ -706,11 +962,13 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                                     segment_vad = prev_vad_confidence if prev_vad_confidence is not None else 0.0
                                 
                                 # Skip segment entirely if VAD is too low (just noise/silence, not speech)
-                                if segment_vad < min_vad_for_identification:
+                                # Only apply VAD filtering if VAD is actually enabled
+                                if vad is not None and segment_vad < min_vad_for_identification:
                                     # Don't emit segment - it's just noise
                                     pass
                                 else:
-                                    # Only try to identify speaker if VAD is high enough
+                                    # Try to identify speaker
+                                    final_similarity = 0.0
                                     if segment_waveform.shape[1] >= sample_rate * 0.5 and len(db) > 0:
                                         with torch.no_grad():
                                             full_segment_embedding = classifier.encode_batch(segment_waveform)
@@ -719,15 +977,19 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                                         # Use dynamic threshold - high VAD = confident speech = lower threshold
                                         effective_threshold = get_effective_threshold(segment_vad, threshold)
                                         final_speaker = results[0]["name"] if results and results[0]["similarity"] > effective_threshold else None
+                                        final_similarity = results[0]["similarity"] if results else 0.0
                                     
                                     if not filter_unknown or final_speaker is not None:
-                                        yield json.dumps({
+                                        segment_data = {
                                             "event": "segment",
                                             "start": round(segment_start, 2),
                                             "end": round(current_time, 2),
                                             "speaker": final_speaker,
-                                            "vad_confidence": round(segment_vad, 3)
-                                        }) + "\n"
+                                            "similarity": round(final_similarity, 3) if final_similarity else None
+                                        }
+                                        if vad is not None:
+                                            segment_data["vad_confidence"] = round(segment_vad, 3)
+                                        yield json.dumps(segment_data) + "\n"
                                 accumulated_embedding = None
                                 accumulated_weight = 0.0
                                 best_embedding = None
@@ -782,9 +1044,12 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                         if vad is not None and segment_waveform.shape[1] >= sample_rate * 0.5:
                             _, segment_vad, _ = vad.get_speech_confidence(segment_waveform, sample_rate)
                         else:
-                            segment_vad = prev_vad_confidence if prev_vad_confidence is not None else 0.0
-                        # Only try to identify speaker if VAD is high enough
-                        if segment_vad >= min_vad_for_identification and segment_waveform.shape[1] >= sample_rate * 0.5 and len(db) > 0:
+                            segment_vad = None  # None means VAD is disabled
+                        
+                        # Only try to identify speaker if VAD is high enough (or VAD is disabled)
+                        # When VAD is disabled (segment_vad is None), always try to identify
+                        vad_ok = segment_vad is None or segment_vad >= min_vad_for_identification
+                        if vad_ok and segment_waveform.shape[1] >= sample_rate * 0.5 and len(db) > 0:
                             with torch.no_grad():
                                 full_segment_embedding = classifier.encode_batch(segment_waveform)
                                 full_segment_embedding = full_segment_embedding.squeeze().cpu().numpy()
@@ -795,15 +1060,17 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                             final_similarity = results[0]["similarity"] if results else 0.0
                         
                         # Skip segment entirely if VAD is too low (just noise/silence)
-                        if segment_vad >= min_vad_for_identification:
+                        # Only apply VAD filtering if VAD is actually enabled
+                        if vad is None or segment_vad >= min_vad_for_identification:
                             if not filter_unknown or final_speaker is not None:
                                 segment_data = {
                                     "event": "segment",
                                     "start": round(segment_start, 2),
                                     "end": round(current_time, 2),
-                                    "speaker": final_speaker
+                                    "speaker": final_speaker,
+                                    "similarity": round(final_similarity, 3) if final_similarity else None
                                 }
-                                if prev_vad_confidence is not None:
+                                if vad is not None and prev_vad_confidence is not None:
                                     segment_data["vad_confidence"] = round(prev_vad_confidence, 3)
                                 yield json.dumps(segment_data) + "\n"
                     
@@ -875,11 +1142,14 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                 if vad is not None and segment_waveform.shape[1] >= sample_rate * 0.5:
                     _, segment_vad, _ = vad.get_speech_confidence(segment_waveform, sample_rate)
                 else:
-                    segment_vad = prev_vad_confidence if prev_vad_confidence is not None else 0.0
+                    segment_vad = None  # None means VAD is disabled
                 
                 # Skip segment entirely if VAD is too low (just noise/silence)
-                if segment_vad >= min_vad_for_identification:
-                    # Only try to identify speaker if VAD is high enough
+                # Only apply VAD filtering if VAD is actually enabled
+                vad_ok = segment_vad is None or segment_vad >= min_vad_for_identification
+                if vad_ok:
+                    # Try to identify speaker
+                    final_similarity = 0.0
                     if segment_waveform.shape[1] >= sample_rate * 0.5 and len(db) > 0:
                         with torch.no_grad():
                             full_segment_embedding = classifier.encode_batch(segment_waveform)
@@ -888,13 +1158,15 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                         # Use dynamic threshold - high VAD = confident speech = lower threshold
                         effective_threshold = get_effective_threshold(segment_vad, threshold)
                         final_speaker = results[0]["name"] if results and results[0]["similarity"] > effective_threshold else None
+                        final_similarity = results[0]["similarity"] if results else 0.0
                     
                     if not filter_unknown or final_speaker is not None:
                         segment_data = {
                             "event": "segment",
                             "start": round(segment_start, 2),
                             "end": round(duration, 2),
-                            "speaker": final_speaker
+                            "speaker": final_speaker,
+                            "similarity": round(final_similarity, 3) if final_similarity else None
                         }
                         if prev_vad_confidence is not None:
                             segment_data["vad_confidence"] = round(prev_vad_confidence, 3)
@@ -927,6 +1199,13 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
         use_vad = request.form.get("vad", "true").lower() != "false"
         vad_threshold = float(request.form.get("vad_threshold", 0.5))
         
+        # TS-VAD refinement mode parameters
+        diarization_mode = request.form.get("diarization_mode", "coarse")
+        window_size = float(request.form.get("window_size", 2.0))
+        window_hop = float(request.form.get("window_hop", 0.5))
+        unknown_assign_threshold = float(request.form.get("unknown_assign_threshold", 0.60))
+        min_segment_duration = float(request.form.get("min_segment_duration", 0.5))
+        
         try:
             if response_format == "diarized_json":
                 if stream:
@@ -938,8 +1217,21 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                     response.headers['X-Accel-Buffering'] = 'no'
                     response.headers['Cache-Control'] = 'no-cache'
                     return response
+                elif diarization_mode == "ts_vad":
+                    # TS-VAD refinement mode - non-streaming batch with window-based analysis
+                    vad = get_vad(vad_threshold) if use_vad else None
+                    result = ts_vad_refine(
+                        audio_bytes, classifier, torchaudio, torch, db,
+                        vad=vad,
+                        window_size=window_size,
+                        window_hop=window_hop,
+                        identify_threshold=threshold,
+                        unknown_assign_threshold=unknown_assign_threshold,
+                        min_segment_duration=min_segment_duration
+                    )
+                    return jsonify(result)
                 else:
-                    # Batch response
+                    # Batch response (coarse mode)
                     result = diarize_audio_bytes(
                         audio_bytes, classifier, torchaudio, torch, db,
                         chunk_size=chunk_size,

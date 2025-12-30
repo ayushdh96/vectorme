@@ -717,6 +717,7 @@
             const [audioBlob, setAudioBlob] = useState(null);
             const [duration, setDuration] = useState(0);
             const [segments, setSegments] = useState([]);
+            const [refinedSegments, setRefinedSegments] = useState([]); // TS-VAD refined segments
             const [events, setEvents] = useState([]);
             const [speakers, setSpeakers] = useState([]);
             const [speakerMap] = useState(new Map());
@@ -726,6 +727,7 @@
             const [selectedExistingSpeaker, setSelectedExistingSpeaker] = useState(null);
             const [isSaving, setIsSaving] = useState(false);
             const [knownSpeakers, setKnownSpeakers] = useState([]);
+            const [unknownSpeakers, setUnknownSpeakers] = useState([]); // unknown speaker clusters from TS-VAD
             
             // Saved recordings state
             const [savedRecordings, setSavedRecordings] = useState([]);
@@ -758,6 +760,35 @@
             const audioContextRef = useRef(null);
             const analyserRef = useRef(null);
             const animationRef = useRef(null);
+
+            const pickSupportedAudioMimeType = useCallback(() => {
+                if (!window.MediaRecorder || typeof MediaRecorder.isTypeSupported !== 'function') {
+                    return null;
+                }
+
+                const candidates = [
+                    'audio/webm;codecs=opus',
+                    'audio/webm',
+                    'audio/mp4',
+                ];
+
+                for (const candidate of candidates) {
+                    try {
+                        if (MediaRecorder.isTypeSupported(candidate)) return candidate;
+                    } catch (_) {
+                        // ignore
+                    }
+                }
+
+                return null;
+            }, []);
+
+            const filenameForBlob = useCallback((blob) => {
+                const type = (blob && blob.type) ? blob.type : '';
+                if (type.includes('webm')) return 'recording.webm';
+                if (type.includes('mp4')) return 'recording.mp4';
+                return 'recording.audio';
+            }, []);
 
             // Initialize recording waveform
             useEffect(() => {
@@ -886,21 +917,25 @@
 
             const startRecording = useCallback(async () => {
                 try {
+                    // Note: Don't specify sampleRate - browsers don't support it well
+                    // The backend will resample to 16kHz via ffmpeg
                     const stream = await navigator.mediaDevices.getUserMedia({ 
                         audio: {
-                            channelCount: 1,
-                            sampleRate: 16000,
                             echoCancellation: true,
-                            noiseSuppression: true
+                            noiseSuppression: true,
+                            autoGainControl: true
                         } 
                     });
                     streamRef.current = stream;
+                    console.log('[Recording] Got media stream:', stream.getAudioTracks()[0]?.getSettings());
 
                     // Clear previous state
                     audioChunksRef.current = [];
                     lastProcessedChunkRef.current = 0;
                     processingRef.current = false;
                     setSegments([]);
+                    setRefinedSegments([]);
+                    setUnknownSpeakers([]);
                     setEvents([]);
                     setSpeakers([]);
                     speakerMap.clear();
@@ -921,21 +956,24 @@
                     setAudioBlob(null);
 
                     // Create MediaRecorder
-                    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
-                        ? 'audio/webm;codecs=opus' 
-                        : 'audio/webm';
-                    
-                    mediaRecorderRef.current = new MediaRecorder(stream, { mimeType });
+                    const mimeType = pickSupportedAudioMimeType();
+                    console.log('[Recording] Using mimeType:', mimeType);
+                    const recorderOptions = mimeType ? { mimeType } : undefined;
+                    mediaRecorderRef.current = new MediaRecorder(stream, recorderOptions);
+                    console.log('[Recording] MediaRecorder created, state:', mediaRecorderRef.current.state);
 
                     mediaRecorderRef.current.ondataavailable = async (event) => {
+                        console.log('[Recording] ondataavailable, size:', event.data.size, 'type:', event.data.type);
                         if (event.data.size > 0) {
                             audioChunksRef.current.push(event.data);
+                            console.log('[Recording] Total chunks:', audioChunksRef.current.length);
                             
                             // Stream to backend every 3 chunks (3 seconds) for real-time results
                             if (audioChunksRef.current.length >= 3 && 
                                 audioChunksRef.current.length % 2 === 0 &&
                                 !processingRef.current) {
-                                const blob = new Blob(audioChunksRef.current, { type: mimeType });
+                                const blob = new Blob(audioChunksRef.current, { type: mimeType || event.data.type });
+                                console.log('[Recording] Sending partial blob, size:', blob.size);
                                 // Process in background, don't await
                                 processStreamingDiarization(blob, true);
                             }
@@ -943,23 +981,39 @@
                     };
 
                     mediaRecorderRef.current.onstop = async () => {
-                        const blob = new Blob(audioChunksRef.current, { type: mimeType });
+                        console.log('[Recording] onstop, total chunks:', audioChunksRef.current.length);
+                        const blobType = mimeType || (audioChunksRef.current[0] && audioChunksRef.current[0].type) || 'audio/webm';
+                        const blob = new Blob(audioChunksRef.current, { type: blobType });
+                        console.log('[Recording] Final blob size:', blob.size, 'type:', blob.type);
                         setAudioBlob(blob);
-                        
-                        // Final diarization with complete audio
-                        await processStreamingDiarization(blob, false);
+
+                        try {
+                            // Final diarization with complete audio (coarse streaming)
+                            await processStreamingDiarization(blob, false);
+
+                            // Run TS-VAD refinement pass (optional - comment out if causing issues)
+                            // await processRefinedDiarization(blob);
+                        } finally {
+                            if (streamRef.current) {
+                                streamRef.current.getTracks().forEach(track => track.stop());
+                                streamRef.current = null;
+                            }
+                            if (audioContextRef.current) {
+                                audioContextRef.current.close();
+                                audioContextRef.current = null;
+                            }
+                        }
                     };
 
-                    // Start recording with timeslice for streaming (1 second chunks)
-                    mediaRecorderRef.current.start(1000);
-                    setIsRecording(true);
-                    setIsPaused(false);
-                    setStatus('recording');
-                    setStatusText('Recording... Results will appear in real-time');
-
-                    // Start live visualization using AudioContext
+                    // Start live visualization using AudioContext BEFORE starting MediaRecorder
+                    // This ensures the analyser is ready when recording begins
                     const audioContext = new AudioContext();
                     audioContextRef.current = audioContext;
+                    if (audioContext.state === 'suspended') {
+                        await audioContext.resume();
+                    }
+                    console.log('[Recording] AudioContext state:', audioContext.state);
+                    
                     const source = audioContext.createMediaStreamSource(stream);
                     const analyser = audioContext.createAnalyser();
                     analyserRef.current = analyser;
@@ -969,8 +1023,18 @@
                     const bufferLength = analyser.frequencyBinCount;
                     const dataArray = new Uint8Array(bufferLength);
 
+                    // Start the waveform animation loop
                     const drawWaveform = () => {
-                        if (mediaRecorderRef.current?.state !== 'recording') {
+                        // Continue drawing even if MediaRecorder hasn't started yet
+                        if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') {
+                            // Keep trying until recording starts, or we're stopped
+                            if (streamRef.current) {
+                                animationRef.current = requestAnimationFrame(drawWaveform);
+                            }
+                            return;
+                        }
+                        
+                        if (mediaRecorderRef.current.state !== 'recording' && mediaRecorderRef.current.state !== 'paused') {
                             animationRef.current = null;
                             return;
                         }
@@ -1024,35 +1088,37 @@
                         // Add glow effect based on intensity
                         const average = dataArray.reduce((a, b) => a + Math.abs(b - 128), 0) / bufferLength;
                         const intensity = Math.min(average / 50, 1);
-                        waveformRef.current.style.boxShadow = `inset 0 0 ${20 + intensity * 30}px rgba(74, 158, 255, ${intensity * 0.5})`;
+                        if (waveformRef.current) {
+                            waveformRef.current.style.boxShadow = `inset 0 0 ${20 + intensity * 30}px rgba(74, 158, 255, ${intensity * 0.5})`;
+                        }
                     };
                     
+                    // Start waveform animation immediately
                     drawWaveform();
+
+                    // Now start recording with timeslice for streaming (1 second chunks)
+                    mediaRecorderRef.current.start(1000);
+                    console.log('[Recording] MediaRecorder started, state:', mediaRecorderRef.current.state);
+                    setIsRecording(true);
+                    setIsPaused(false);
+                    setStatus('recording');
+                    setStatusText('Recording... Results will appear in real-time');
 
                 } catch (error) {
                     console.error('Error starting recording:', error);
                     setStatus('ready');
                     setStatusText('Error: Could not access microphone');
                 }
-            }, [speakerMap, processStreamingDiarization]);
+            }, [speakerMap, processStreamingDiarization, processRefinedDiarization, pickSupportedAudioMimeType]);
 
             const stopRecording = useCallback(() => {
                 if (mediaRecorderRef.current && (mediaRecorderRef.current.state === 'recording' || mediaRecorderRef.current.state === 'paused')) {
                     mediaRecorderRef.current.stop();
                 }
-                if (streamRef.current) {
-                    streamRef.current.getTracks().forEach(track => track.stop());
-                    streamRef.current = null;
-                }
                 // Cancel animation frame
                 if (animationRef.current) {
                     cancelAnimationFrame(animationRef.current);
                     animationRef.current = null;
-                }
-                // Close audio context
-                if (audioContextRef.current) {
-                    audioContextRef.current.close();
-                    audioContextRef.current = null;
                 }
                 setIsRecording(false);
                 setIsPaused(false);
@@ -1087,10 +1153,10 @@
 
                 try {
                     const formData = new FormData();
-                    formData.append('file', blob, 'recording.webm');
+                    formData.append('file', blob, filenameForBlob(blob));
                     formData.append('response_format', 'diarized_json');
                     formData.append('stream', 'true');
-                    formData.append('vad', 'true');
+                    formData.append('vad', 'false');
                     formData.append('chunk_size', '2.0');
                     formData.append('chunk_hop', '0.5');
 
@@ -1107,11 +1173,22 @@
                     const decoder = new TextDecoder();
                     let buffer = '';
 
-                    // Collect all segments and events from this response before updating state
+                    // Incrementally apply events so UI updates in real-time
                     const newSegments = [];
                     const newEvents = [];
                     let newDuration = duration;
                     let newSpeakers = speakers;
+
+                    let lastUiUpdateAt = 0;
+                    const maybeUpdateUi = (force = false) => {
+                        const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                        if (!force && (now - lastUiUpdateAt) < 100) return;
+                        lastUiUpdateAt = now;
+                        setSegments([...newSegments]);
+                        setEvents([...newEvents]);
+                        setDuration(newDuration);
+                        setSpeakers(newSpeakers);
+                    };
 
                     while (true) {
                         const { done, value } = await reader.read();
@@ -1138,10 +1215,13 @@
                                                 start: event.start,
                                                 end: event.end,
                                                 speaker: event.speaker,
+                                                similarity: event.similarity,
                                                 vad_confidence: event.vad_confidence
                                             });
                                             break;
                                     }
+
+                                    maybeUpdateUi(false);
                                 } catch (e) {
                                     console.error('Error parsing event:', e);
                                 }
@@ -1149,18 +1229,32 @@
                         }
                     }
 
-                    // Batch update state once after all data is collected (prevents flicker)
-                    if (isPartial) {
-                        // For partial updates, replace all segments at once
-                        setSegments(newSegments);
-                        setEvents(newEvents);
-                    } else {
-                        // For final update, replace everything
-                        setSegments(newSegments);
-                        setEvents(newEvents);
+                    // Flush any remaining buffered line
+                    if (buffer.trim()) {
+                        try {
+                            const event = JSON.parse(buffer);
+                            newEvents.push(event);
+                            switch (event.event) {
+                                case 'start':
+                                    newDuration = event.duration;
+                                    newSpeakers = event.speakers || [];
+                                    break;
+                                case 'segment':
+                                    newSegments.push({
+                                        start: event.start,
+                                        end: event.end,
+                                        speaker: event.speaker,
+                                        similarity: event.similarity,
+                                        vad_confidence: event.vad_confidence
+                                    });
+                                    break;
+                            }
+                        } catch (e) {
+                            console.error('Error parsing event:', e);
+                        }
                     }
-                    setDuration(newDuration);
-                    setSpeakers(newSpeakers);
+
+                    maybeUpdateUi(true);
 
                     if (!isPartial) {
                         setStatus('ready');
@@ -1176,7 +1270,58 @@
                 } finally {
                     processingRef.current = false;
                 }
-            }, [duration, speakers]);
+            }, [duration, speakers, filenameForBlob]);
+
+            const processRefinedDiarization = useCallback(async (blob) => {
+                try {
+                    setStatus('processing');
+                    setStatusText('Running TS-VAD refinement...');
+
+                    const formData = new FormData();
+                    formData.append('file', blob, filenameForBlob(blob));
+                    formData.append('response_format', 'diarized_json');
+                    formData.append('stream', 'false');
+                    formData.append('diarization_mode', 'ts_vad');
+                    formData.append('window_size', '2.0');
+                    formData.append('window_hop', '0.5');
+                    formData.append('vad', 'true');
+
+                    const response = await fetch('/v1/audio/transcriptions', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+
+                    const result = await response.json();
+
+                    // Update refined segments and unknown speakers
+                    setRefinedSegments(result.segments || []);
+                    setUnknownSpeakers(result.unknown_speakers || []);
+                    setKnownSpeakers(result.known_speakers || []);
+
+                    // Add TS-VAD events to event log
+                    const tsVadEvents = [
+                        { event: 'ts_vad_start', mode: result.mode, duration: result.duration },
+                        ...(result.segments || []).map(seg => ({
+                            event: 'segment',
+                            ...seg
+                        })),
+                        { event: 'ts_vad_done', unknown_count: result.unknown_speakers?.length || 0 }
+                    ];
+                    setEvents(prev => [...prev, ...tsVadEvents]);
+
+                    setStatus('ready');
+                    setStatusText('TS-VAD refinement complete');
+
+                } catch (error) {
+                    console.error('Error processing TS-VAD refinement:', error);
+                    setStatus('ready');
+                    setStatusText('Error in TS-VAD refinement');
+                }
+            }, [filenameForBlob]);
 
             const togglePlayback = useCallback(() => {
                 if (playbackWavesurferRef.current) {
@@ -1310,7 +1455,7 @@
                 setIsSavingRecording(true);
                 try {
                     const formData = new FormData();
-                    formData.append('file', audioBlob, 'recording.webm');
+                    formData.append('file', audioBlob, filenameForBlob(audioBlob));
                     formData.append('name', recordingName.trim() || `Recording ${new Date().toLocaleString()}`);
                     formData.append('duration', duration.toString());
                     
@@ -1336,7 +1481,7 @@
                 } finally {
                     setIsSavingRecording(false);
                 }
-            }, [audioBlob, recordingName, duration, fetchRecordings, isSavingRecording]);
+            }, [audioBlob, recordingName, duration, fetchRecordings, isSavingRecording, filenameForBlob]);
             
             // Load a saved recording
             const loadRecording = useCallback(async (recording) => {
@@ -1361,6 +1506,8 @@
                     
                     // Clear previous state
                     setSegments([]);
+                    setRefinedSegments([]);
+                    setUnknownSpeakers([]);
                     setEvents([]);
                     setSpeakers([]);
                     speakerMap.clear();
@@ -1376,8 +1523,11 @@
                     // Set the audio blob (this will trigger playback waveform creation)
                     setAudioBlob(blob);
                     
-                    // Process diarization
+                    // Process diarization (coarse streaming)
                     await processStreamingDiarization(blob, false);
+                    
+                    // Process TS-VAD refinement (optional - uncomment to enable)
+                    // await processRefinedDiarization(blob);
                     
                 } catch (error) {
                     console.error('Error loading recording:', error);
@@ -1386,7 +1536,7 @@
                 } finally {
                     setIsLoadingRecording(false);
                 }
-            }, [isLoadingRecording, isRecording, processStreamingDiarization, speakerMap]);
+            }, [isLoadingRecording, isRecording, processStreamingDiarization, processRefinedDiarization, speakerMap]);
             
             // Delete a saved recording
             const deleteRecording = useCallback(async (recording, e) => {
@@ -1452,7 +1602,7 @@
                 setIsSaving(true);
                 try {
                     const formData = new FormData();
-                    formData.append('file', audioBlob, 'recording.webm');
+                    formData.append('file', audioBlob, filenameForBlob(audioBlob));
                     formData.append('name', speakerName);
                     formData.append('start', namingSegment.start.toString());
                     formData.append('end', namingSegment.end.toString());
@@ -1470,12 +1620,22 @@
                     const result = await response.json();
                     console.log('Speaker saved:', result);
                     
-                    // Update the segment with the new speaker name
+                    // Update the segment with the new speaker name in both segment arrays
                     setSegments(prev => prev.map(seg => 
                         seg.start === namingSegment.start && seg.end === namingSegment.end
                             ? { ...seg, speaker: speakerName }
                             : seg
                     ));
+                    setRefinedSegments(prev => prev.map(seg => 
+                        seg.start === namingSegment.start && seg.end === namingSegment.end
+                            ? { ...seg, speaker: speakerName }
+                            : seg
+                    ));
+                    
+                    // Remove from unknown speakers if it was an unknown cluster
+                    if (namingSegment.speaker && namingSegment.speaker.startsWith('unknown_')) {
+                        setUnknownSpeakers(prev => prev.filter(u => u !== namingSegment.speaker));
+                    }
                     
                     // Update known speakers list
                     if (!knownSpeakers.includes(speakerName)) {
@@ -1492,7 +1652,7 @@
                 } finally {
                     setIsSaving(false);
                 }
-            }, [namingSegment, audioBlob, selectedExistingSpeaker, newSpeakerName, knownSpeakers, speakerMap, closeNamingModal]);
+            }, [namingSegment, audioBlob, selectedExistingSpeaker, newSpeakerName, knownSpeakers, speakerMap, closeNamingModal, filenameForBlob]);
 
             const reprocessAudio = useCallback(async () => {
                 if (!audioBlob || processingRef.current) return;
@@ -1502,7 +1662,10 @@
                 
                 // Clear segments to show fresh results
                 await processStreamingDiarization(audioBlob, false);
-            }, [audioBlob, processStreamingDiarization]);
+                
+                // Also re-run TS-VAD refinement (optional)
+                // await processRefinedDiarization(audioBlob);
+            }, [audioBlob, processStreamingDiarization, processRefinedDiarization]);
 
             // Compare all segments against a specific speaker
             const compareToSpeaker = useCallback(async (speakerName) => {
@@ -1520,7 +1683,7 @@
                 
                 try {
                     const formData = new FormData();
-                    formData.append('file', audioBlob, 'recording.webm');
+                    formData.append('file', audioBlob, filenameForBlob(audioBlob));
                     formData.append('segments', JSON.stringify(segments.map(s => ({ start: s.start, end: s.end }))));
                     
                     const response = await fetch(`/v1/speakers/${encodeURIComponent(speakerName)}/compare`, {
@@ -1543,7 +1706,7 @@
                     console.error('Error comparing to speaker:', error);
                     setCompareSpeaker(null);
                 }
-            }, [audioBlob, segments, compareSpeaker]);
+            }, [audioBlob, segments, compareSpeaker, filenameForBlob]);
 
             // Identify a single segment against speaker database
             const identifySegment = useCallback(async (seg, e) => {
@@ -1555,7 +1718,7 @@
                 
                 try {
                     const formData = new FormData();
-                    formData.append('file', audioBlob, 'recording.webm');
+                    formData.append('file', audioBlob, filenameForBlob(audioBlob));
                     formData.append('start', seg.start.toString());
                     formData.append('end', seg.end.toString());
                     
@@ -1589,7 +1752,7 @@
                 } finally {
                     setIdentifyingSegment(null);
                 }
-            }, [audioBlob, speakerMap]);
+            }, [audioBlob, speakerMap, filenameForBlob]);
 
             return (
                 <div className="container">
@@ -1611,7 +1774,7 @@
                                     ref={canvasRef} 
                                     width={800} 
                                     height={50}
-                                    style={{ width: '100%', height: '50px', borderRadius: '8px' }}
+                                    style={{ width: '100%', height: '50px', borderRadius: '8px', position: 'relative', zIndex: 2 }}
                                 />
                             ) : !audioBlob ? (
                                 <div style={{ 
@@ -1653,6 +1816,67 @@
                                 </>
                             )}
                         </div>
+                        
+                        {/* Live diarization display during recording */}
+                        {isRecording && segments.length > 0 && (
+                            <div style={{ marginTop: '16px' }}>
+                                <div style={{ 
+                                    display: 'flex', 
+                                    alignItems: 'center', 
+                                    gap: '8px',
+                                    marginBottom: '12px',
+                                    color: '#4a9eff'
+                                }}>
+                                    <span className="live-dot" style={{ width: '8px', height: '8px', background: '#ff416c', borderRadius: '50%', animation: 'pulse 1.5s infinite' }}></span>
+                                    <span style={{ fontWeight: 600 }}>Live Speaker Detection</span>
+                                    <span style={{ color: '#888', fontSize: '13px' }}>({segments.length} segments)</span>
+                                </div>
+                                <div className="diarization-results" style={{ maxHeight: '200px', overflowY: 'auto' }}>
+                                    {segments.slice().reverse().map((seg, i) => {
+                                        const isUnknownSpeaker = seg.speaker && seg.speaker.startsWith('unknown_');
+                                        const displaySpeaker = isUnknownSpeaker 
+                                            ? `Unknown (${seg.speaker})`
+                                            : (seg.speaker || 'Unknown Speaker');
+                                        const similarityPercent = seg.similarity ? Math.round(seg.similarity * 100) : null;
+                                        const similarityColor = seg.similarity >= 0.7 ? '#38ef7d' : seg.similarity >= 0.5 ? '#ffd200' : '#ff6b8a';
+                                        return (
+                                            <div 
+                                                key={i} 
+                                                className="segment"
+                                                style={{ 
+                                                    opacity: i === 0 ? 1 : 0.7,
+                                                    transition: 'opacity 0.3s'
+                                                }}
+                                            >
+                                                <span className="segment-time">
+                                                    {formatTime(seg.start)} → {formatTime(seg.end)}
+                                                </span>
+                                                <span 
+                                                    className={`segment-speaker ${seg.speaker && !isUnknownSpeaker ? 'known' : 'unknown'}`}
+                                                    style={seg.speaker && !isUnknownSpeaker ? { background: getSpeakerColor(seg.speaker, speakerMap) } : {}}
+                                                >
+                                                    {displaySpeaker}
+                                                </span>
+                                                {similarityPercent !== null && (
+                                                    <span 
+                                                        style={{
+                                                            color: similarityColor,
+                                                            fontWeight: 600,
+                                                            fontSize: '12px',
+                                                            marginLeft: '8px',
+                                                            fontFamily: "'Monaco', 'Consolas', monospace"
+                                                        }}
+                                                        title={`Speaker match confidence: ${similarityPercent}%`}
+                                                    >
+                                                        {similarityPercent}%
+                                                    </span>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        )}
                     </div>
 
                     {audioBlob && (
@@ -1810,20 +2034,18 @@
                         </div>
                     )}
 
-                    {segments.length > 0 && (
+                    {audioBlob && (
                         <div className="card">
                             <div className="card-header">
                                 <h3>🎯 Speaker Diarization</h3>
-                                {audioBlob && (
-                                    <button 
-                                        className="btn-reprocess" 
-                                        onClick={reprocessAudio}
-                                        disabled={status === 'processing' || isRecording}
-                                        title="Re-analyze audio with updated speaker database"
-                                    >
-                                        🔄 Reprocess
-                                    </button>
-                                )}
+                                <button 
+                                    className="btn-reprocess" 
+                                    onClick={reprocessAudio}
+                                    disabled={status === 'processing' || isRecording}
+                                    title="Re-analyze audio with updated speaker database"
+                                >
+                                    🔄 Reprocess
+                                </button>
                             </div>
                             
                             {speakers.length > 0 && (
@@ -1876,10 +2098,16 @@
                                         }
                                     }}
                                 >
-                                    {segments.map((seg, i) => {
+                                    {(() => {
+                                        const allSegments = [...(refinedSegments || []), ...(segments || [])].filter(s => s);
+                                        return allSegments.sort((a, b) => a.start - b.start).map((seg, i) => {
                                         const left = (seg.start / duration) * 100;
                                         const width = ((seg.end - seg.start) / duration) * 100;
                                         const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
+                                        const isUnknownSpeaker = seg.speaker && seg.speaker.startsWith('unknown_');
+                                        const displaySpeaker = isUnknownSpeaker 
+                                            ? seg.speaker.replace('unknown_', 'U')
+                                            : (seg.speaker || '?');
                                         return (
                                             <div
                                                 key={i}
@@ -1888,15 +2116,16 @@
                                                 style={{
                                                     left: `${left}%`,
                                                     width: `${width}%`,
-                                                    background: getSpeakerColor(seg.speaker, speakerMap),
+                                                    background: (seg.speaker && !isUnknownSpeaker) ? getSpeakerColor(seg.speaker, speakerMap) : '#666',
                                                     cursor: audioBlob ? 'pointer' : 'default'
                                                 }}
                                                 title={`${seg.speaker || 'Unknown'}: ${formatTime(seg.start)} - ${formatTime(seg.end)}${audioBlob ? ' (click to play)' : ''}`}
                                             >
-                                                {width > 10 ? (seg.speaker || '?') : ''}
+                                                {width > 10 ? displaySpeaker : ''}
                                             </div>
                                         );
-                                    })}
+                                        });
+                                    })()}
                                 </div>
                                 {activeSegment && (
                                     <div className="timeline-info">
@@ -1936,10 +2165,17 @@
                             )}
 
                             <div className="diarization-results">
-                                {segments.map((seg, i) => {
+                                {(() => {
+                                    const allSegments = [...(refinedSegments || []), ...(segments || [])].filter(s => s);
+                                    return allSegments.sort((a, b) => a.start - b.start).map((seg, i) => {
                                     const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
                                     const segKey = `${seg.start}-${seg.end}`;
                                     const similarity = segmentSimilarities[segKey];
+                                    const isUnknownSpeaker = seg.speaker && seg.speaker.startsWith('unknown_');
+                                    const displaySpeaker = isUnknownSpeaker 
+                                        ? `Unknown (${seg.speaker})`
+                                        : (seg.speaker || 'Unknown Speaker');
+                                    
                                     return (
                                     <div 
                                         key={i} 
@@ -1951,6 +2187,22 @@
                                         <span className="segment-time">
                                             {formatTime(seg.start)} → {formatTime(seg.end)}
                                         </span>
+                                        {seg.cause && (
+                                            <span 
+                                                style={{
+                                                    fontSize: '10px',
+                                                    padding: '2px 6px',
+                                                    borderRadius: '4px',
+                                                    background: seg.cause === 'ts_vad' ? 'rgba(56, 239, 125, 0.2)' : 'rgba(74, 158, 255, 0.2)',
+                                                    color: seg.cause === 'ts_vad' ? '#38ef7d' : '#4a9eff',
+                                                    fontWeight: 600,
+                                                    marginLeft: '4px'
+                                                }}
+                                                title={seg.cause === 'ts_vad' ? 'TS-VAD refined segment' : 'Streaming coarse segment'}
+                                            >
+                                                {seg.cause === 'ts_vad' ? '🎯 TS-VAD' : '🌊 Stream'}
+                                            </span>
+                                        )}
                                         {seg.vad_confidence !== undefined && (
                                             <span 
                                                 className={`segment-vad-confidence ${seg.vad_confidence >= 0.8 ? 'high' : seg.vad_confidence >= 0.5 ? 'medium' : 'low'}`}
@@ -1960,11 +2212,28 @@
                                             </span>
                                         )}
                                         <span 
-                                            className={`segment-speaker ${seg.speaker ? 'known' : 'unknown'}`}
-                                            style={seg.speaker ? { background: getSpeakerColor(seg.speaker, speakerMap) } : {}}
+                                            className={`segment-speaker ${seg.speaker && !isUnknownSpeaker ? 'known' : 'unknown'}`}
+                                            style={seg.speaker && !isUnknownSpeaker ? { background: getSpeakerColor(seg.speaker, speakerMap) } : {}}
                                         >
-                                            {seg.speaker || 'Unknown Speaker'}
+                                            {displaySpeaker}
                                         </span>
+                                        {/* Show segment's intrinsic similarity (from backend) when not comparing */}
+                                        {!compareSpeaker && seg.similarity !== undefined && seg.similarity !== null && (
+                                            <span 
+                                                className="segment-similarity"
+                                                style={{
+                                                    color: seg.similarity >= 0.7 ? '#38ef7d' : seg.similarity >= 0.5 ? '#ffd200' : '#ff6b8a',
+                                                    fontWeight: 600,
+                                                    fontSize: '13px',
+                                                    marginLeft: '8px',
+                                                    fontFamily: "'Monaco', 'Consolas', monospace"
+                                                }}
+                                                title={`Speaker match confidence: ${(seg.similarity * 100).toFixed(1)}%`}
+                                            >
+                                                {(seg.similarity * 100).toFixed(0)}%
+                                            </span>
+                                        )}
+                                        {/* Show comparison similarity when comparing to a specific speaker */}
                                         {compareSpeaker && similarity !== undefined && (
                                             <span 
                                                 className="segment-similarity"
@@ -2017,7 +2286,8 @@
                                         )}
                                     </div>
                                     );
-                                })}
+                                    });
+                                })()}
                             </div>
                         </div>
                     )}
