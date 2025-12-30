@@ -15,3 +15,9 @@ build/
 
 # Model cache (downloaded separately)
 ~/.cache/
+
+#virtual environments
+venv/
+env/
+.venv/
+.env/
