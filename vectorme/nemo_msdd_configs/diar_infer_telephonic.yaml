@@ -1,0 +1,90 @@
+# NeMo offline diarization + MSDD refinement (telephonic)
+# Used by vectorme backend for Stop-Recording refinement.
+# Notes:
+# - No transcription: ASR is disabled.
+# - Do NOT add a top-level `device:` key here (some NeMo configs are strict and will crash).
+# - `msdd_model.parameters` MUST exist (even if you tune later), otherwise NeMo will raise a missing-key error.
+
+name: "ClusterDiarizer"
+num_workers: 0
+sample_rate: 16000
+batch_size: 1
+verbose: False
+
+diarizer:
+  manifest_filepath: null
+  out_dir: null
+
+  oracle_vad: False
+  collar: 0.25
+  ignore_overlap: True
+
+  # -----------------
+  # VAD (NeMo)
+  # -----------------
+  vad:
+    # Use NeMo VAD (set to a pretrained name or local .nemo)
+    model_path: vad_marblenet
+    # If you ever want to feed external VAD, set model_path: null and set external_vad_manifest.
+    external_vad_manifest: null
+    parameters:
+      window_length_in_sec: 2.0  # Window length in sec for VAD context input 
+      shift_length_in_sec: 0.2 # Shift length in sec for generate frame level VAD prediction
+      smoothing: False # False or type of smoothing method (eg: median)
+      overlap: 0.5 # Overlap ratio for overlapped mean/median smoothing filter
+      onset: 0.05 # Onset threshold for detecting the beginning and end of a speech 
+      offset: 0.05 # Offset threshold for detecting the end of a speech
+      pad_onset: 0.1 # Adding durations before each speech segment 
+      pad_offset: 0.0 # Adding durations after each speech segment 
+      min_duration_on: 0.2 # Threshold for small non_speech deletion
+      min_duration_off: 0.05 # Threshold for short speech segment deletion
+      filter_speech_first: True
+
+  # -----------------
+  # Speaker embeddings (NeMo)
+  # -----------------
+  # This is the NeMo embedding model used for diarization/MSDD.
+  # You can set this to `titanet_large` OR `ecapa_tdnn` (both are valid NeMo speaker models).
+  speaker_embeddings:
+    model_path: ecapa_tdnn
+    parameters:
+      # Multi-scale embeddings required for MSDD to work properly
+      window_length_in_sec: [1.5, 1.25, 1.0, 0.75, 0.5]
+      shift_length_in_sec: [0.75, 0.625, 0.5, 0.375, 0.25]
+      multiscale_weights: [1.0, 1.0, 1.0, 1.0, 1.0]
+      # MUST be true for MSDD.
+      save_embeddings: True
+
+  # -----------------
+  # Clustering
+  # -----------------
+  clustering:
+    parameters:
+      oracle_num_speakers: False
+      max_num_speakers: 10
+      max_rp_threshold: 0.25 # Determines the range of p-value search: 0 < p <= max_rp_threshold.
+      sparse_search_volume: 30 # The higher the number, the more values will be examined with more time. 
+      maj_vote_spk_count: False  # If True, take a majority vote on multiple p-values to estimate the number of speakers.
+      chunk_cluster_count: 50 # Number of forced clusters (overclustering) per unit chunk in long-form audio clustering.
+      embeddings_per_chunk: 10000 # Number of embeddings in each chunk for long-form audio clustering. Adjust based on GPU memory capacity. (default: 10000, approximately 40 mins of audio) 
+      # Keep other knobs minimal; add more only if you need them.
+
+  # -----------------
+  # MSDD (TS-VAD-style refinement)
+  # -----------------
+  msdd_model:
+    model_path: diar_msdd_telephonic
+    parameters:
+      use_speaker_model_from_ckpt: True
+      infer_batch_size: 25
+      sigmoid_threshold: [0.6]
+      seq_eval_mode: False
+      split_infer: True
+      diar_window_length: 50
+      overlap_infer_spk_limit: 5
+
+  # -----------------
+  # ASR (disabled)
+  # -----------------
+  asr:
+    model_path: null

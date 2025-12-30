@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 import numpy as np
+from typing import Optional, List, Dict, Any, Tuple
 
 # Suppress noisy warnings from dependencies
 os.environ["PYTHONWARNINGS"] = "ignore"
@@ -557,258 +558,374 @@ def diarize_audio_bytes(audio_bytes, classifier, torchaudio, torch, db,
             os.unlink(temp_wav)
 
 
-def ts_vad_refine(audio_bytes, classifier, torchaudio, torch, db, vad=None,
-                   window_size=2.0, window_hop=0.5, identify_threshold=0.5,
-                   unknown_assign_threshold=0.60, min_segment_duration=0.5):
-    """TS-VAD-style refinement with sliding windows, unknown speaker clustering, and segment merging.
-    
-    Args:
-        audio_bytes: Raw audio data
-        classifier: ECAPA-TDNN classifier
-        torchaudio: torchaudio module
-        torch: torch module
-        db: VectorDB instance
-        vad: Optional SileroVAD instance
-        window_size: Window duration in seconds (default 2.0)
-        window_hop: Hop between windows in seconds (default 0.5)
-        identify_threshold: Cosine similarity threshold for known speaker match (default 0.5)
-        unknown_assign_threshold: Threshold for assigning to existing unknown cluster (default 0.60)
-        min_segment_duration: Minimum segment duration in seconds (default 0.5)
-    
-    Returns:
-        dict with mode, duration, segments, unknown_speakers, known_speakers
+
+
+
+# ------------------- NeMo MSDD diarization + known-speaker naming -------------------
+
+def _nemo_create_msdd_config(
+    work_dir: str,
+    wav_path: str,
+    duration: float,
+    device: str,
+    domain_type: str = "telephonic",
+) -> "OmegaConf":
+    """Create a NeMo diarization config from the local YAML file and override runtime fields.
+
+    This mirrors the approach used in your `diarize.py` (NeuralDiarizer(cfg=create_config(...)).to(device)).
+    We keep it offline diarization only (no transcription).
     """
-    temp_input = None
-    temp_wav = None
-    
-    try:
-        # Write bytes to temp file
-        temp_fd, temp_input = tempfile.mkstemp()
-        os.write(temp_fd, audio_bytes)
-        os.close(temp_fd)
-        
-        # Convert through ffmpeg to 16kHz mono WAV
-        temp_fd2, temp_wav = tempfile.mkstemp(suffix='.wav')
-        os.close(temp_fd2)
-        
-        result = subprocess.run(
-            ['ffmpeg', '-i', temp_input, '-ar', '16000', '-ac', '1', '-y', temp_wav],
-            capture_output=True,
-            text=True
+    from omegaconf import OmegaConf
+
+    # Local YAML should live next to this file under nemo_msdd_configs/
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    cfg_path = os.path.join(base_dir, "nemo_msdd_configs", f"diar_infer_{domain_type}.yaml")
+    if not os.path.exists(cfg_path):
+        raise FileNotFoundError(
+            f"NeMo diarization config not found at {cfg_path}. "
+            "Create it under vectorme/nemo_msdd_configs/diar_infer_telephonic.yaml"
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg conversion failed: {result.stderr}")
-        
-        waveform, sample_rate = torchaudio.load(temp_wav)
-        
+
+    cfg = OmegaConf.load(cfg_path)
+
+    # Some NeMo diarization configs are structured; if the YAML is missing a root `device` key,
+    # NeMo may crash when it tries to access cfg.device. Ensure it exists.
+    try:
+        has_device_key = ("device" in cfg)
+    except Exception:
+        has_device_key = hasattr(cfg, "device")
+
+    if not has_device_key:
+        # Temporarily disable struct to allow inserting missing keys
+        try:
+            OmegaConf.set_struct(cfg, False)
+        except Exception:
+            pass
+        cfg.device = None
+        try:
+            OmegaConf.set_struct(cfg, True)
+        except Exception:
+            pass
+
+    data_dir = os.path.join(work_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+
+    # NeMo diarization expects a manifest JSONL
+    manifest_path = os.path.join(data_dir, "input_manifest.json")
+    meta = {
+        "audio_filepath": wav_path,
+        "offset": 0,
+        "duration": float(duration) if duration else None,
+        "label": "infer",
+        "text": "-",
+        "rttm_filepath": None,
+        "uem_filepath": None,
+    }
+    with open(manifest_path, "w", encoding="utf-8") as fp:
+        fp.write(json.dumps(meta) + "\n")
+
+    # Override runtime fields
+    cfg.num_workers = 0
+    cfg.diarizer.manifest_filepath = manifest_path
+    cfg.diarizer.out_dir = work_dir
+
+    # Set device only if the config supports it (we ensured the key exists above).
+    # NeuralDiarizer will also be moved to the device via `.to(device)`.
+    try:
+        cfg.device = str(device) if device else None
+    except Exception:
+        pass
+
+    # Ensure we don't accidentally run ASR
+    if "asr" in cfg.diarizer:
+        cfg.diarizer.asr.model_path = None
+
+    return cfg
+
+def _parse_rttm_file(rttm_path: str) -> List[Dict[str, Any]]:
+    """Parse an RTTM file into a list of segments.
+
+    RTTM format: SPEAKER <file-id> 1 <start> <dur> <...> <speaker-id> <...>
+    """
+    segments: List[Dict[str, Any]] = []
+    try:
+        with open(rttm_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 9:
+                    continue
+                if parts[0].upper() != "SPEAKER":
+                    continue
+                start = float(parts[3])
+                dur = float(parts[4])
+                spk = parts[7]
+                end = start + dur
+                segments.append({
+                    "start": start,
+                    "end": end,
+                    "speaker": spk,
+                    "raw_speaker": spk,
+                    "cause": "ts_vad",
+                    "confidence": None,
+                    "similarity": None,
+                })
+    except FileNotFoundError:
+        return []
+
+    # Sort and merge consecutive segments with same label (simple cleanup)
+    segments.sort(key=lambda x: (x["start"], x["end"]))
+    merged: List[Dict[str, Any]] = []
+    for s in segments:
+        if not merged:
+            merged.append(s)
+            continue
+        prev = merged[-1]
+        if prev["speaker"] == s["speaker"] and s["start"] <= prev["end"] + 1e-3:
+            prev["end"] = max(prev["end"], s["end"])
+            # preserve raw_speaker
+            prev["raw_speaker"] = prev["raw_speaker"]
+        else:
+            merged.append(s)
+
+    # Round for API consistency
+    for s in merged:
+        s["start"] = round(float(s["start"]), 2)
+        s["end"] = round(float(s["end"]), 2)
+        # Do NOT round or remove raw_speaker
+    return merged
+
+
+# --- Helper functions for NeMo MSDD + known-speaker naming ---
+def _normalize_vec(v: np.ndarray) -> np.ndarray:
+    v = np.array(v, dtype=np.float32).flatten()
+    n = np.linalg.norm(v)
+    return v / n if n > 0 else v
+
+
+def _concat_waveform_for_speaker(
+    waveform,
+    sample_rate: int,
+    segments: List[Dict[str, Any]],
+    raw_speaker: str,
+    max_total_seconds: float = 12.0,
+) -> Tuple[Optional[Any], float]:
+    """Concatenate audio for a given RTTM raw speaker id.
+
+    Returns (concat_waveform, total_seconds).
+    waveform is a torch Tensor shaped [1, T].
+    """
+    import torch
+
+    pieces = []
+    total = 0.0
+    for s in segments:
+        if s.get("raw_speaker") != raw_speaker:
+            continue
+        start = float(s["start"])
+        end = float(s["end"])
+        dur = max(0.0, end - start)
+        if dur <= 0:
+            continue
+        if total >= max_total_seconds:
+            break
+        # Clamp to remaining budget
+        take = min(dur, max_total_seconds - total)
+        a0 = int(start * sample_rate)
+        a1 = int((start + take) * sample_rate)
+        if a1 <= a0:
+            continue
+        pieces.append(waveform[:, a0:a1])
+        total += take
+
+    if not pieces:
+        return None, 0.0
+
+    return torch.cat(pieces, dim=1), total
+
+
+def _match_cluster_to_known(
+    classifier,
+    torch,
+    cluster_wave,
+    db: 'VectorDB',
+    identify_threshold: float,
+) -> Tuple[Optional[str], float]:
+    """Compute ECAPA embedding for cluster audio and match to VectorDB."""
+    with torch.no_grad():
+        emb = classifier.encode_batch(cluster_wave)
+        emb = _normalize_vec(emb.squeeze().cpu().numpy())
+
+    if len(db) == 0:
+        return None, 0.0
+
+    res = db.query(emb, top_k=1)
+    if res and res[0]["similarity"] >= identify_threshold:
+        return res[0]["name"], float(res[0]["similarity"])
+    return None, float(res[0]["similarity"]) if res else 0.0
+
+
+
+
+def nemo_ts_vad_refine(
+    wav_path: str,
+    duration: float,
+    known_speakers: List[str],
+    classifier,
+    torchaudio,
+    torch,
+    db: 'VectorDB',
+    identify_threshold: float = 0.5,
+    min_segment_duration: float = 0.3,
+    min_cluster_audio_seconds: float = 1.2,
+    device: str = "cpu",
+) -> Dict[str, Any]:
+    """Run NeMo MSDD diarization (TS-VAD-style refinement) and then map diarized speakers to known names.
+
+    - Stage 1: NeMo diarization -> RTTM segments with raw speaker ids.
+    - Stage 2: For each raw speaker id, concatenate that speaker's audio and compute an ECAPA embedding.
+               Match embedding against VectorDB; if match >= identify_threshold, rename to known speaker.
+               Otherwise assign stable unknown_1, unknown_2, ...
+
+    Returns API schema compatible with the frontend: {mode, duration, segments, unknown_speakers, known_speakers, backend}
+    """
+    from omegaconf import OmegaConf
+
+    try:
+        from nemo.collections.asr.models import NeuralDiarizer
+    except Exception as e:
+        raise ImportError("NeMo diarization (NeuralDiarizer) not available") from e
+
+    # Monkey-patch torch.Tensor.view to use reshape for CPU compatibility
+    # This fixes "view size is not compatible with input tensor's size and stride" errors
+    _original_view = torch.Tensor.view
+    def _safe_view(self, *args):
+        try:
+            return _original_view(self, *args)
+        except RuntimeError:
+            return self.reshape(*args)
+    torch.Tensor.view = _safe_view
+
+    work_dir = tempfile.mkdtemp(prefix="nemo_msdd_")
+    try:
+        # Build NeMo config from local YAML and override runtime paths
+        diarizer_cfg = _nemo_create_msdd_config(
+            work_dir=work_dir,
+            wav_path=wav_path,
+            duration=float(duration),
+            device=str(device),
+            domain_type="telephonic",
+        )
+
+        # Run diarization (MSDD enabled via YAML)
+        msdd_model = NeuralDiarizer(cfg=diarizer_cfg).to(str(device))
+        # Some NeMo versions keep a nested _cfg; ensure paths are consistent
+        try:
+            msdd_model._cfg.diarizer.manifest_filepath = diarizer_cfg.diarizer.manifest_filepath
+            msdd_model._cfg.diarizer.out_dir = diarizer_cfg.diarizer.out_dir
+        except Exception:
+            pass
+
+        msdd_model.diarize()
+
+        # NeMo usually writes RTTM under <out_dir>/pred_rttms/mono_file.rttm or <uniq_id>.rttm.
+        # We don't control uniq_id here, so search pred_rttms for the first RTTM.
+        rttm_dir = os.path.join(work_dir, "pred_rttms")
+        rttm_path = None
+        if os.path.isdir(rttm_dir):
+            for fn in os.listdir(rttm_dir):
+                if fn.lower().endswith(".rttm"):
+                    rttm_path = os.path.join(rttm_dir, fn)
+                    break
+
+        if not rttm_path or not os.path.exists(rttm_path):
+            raise RuntimeError("NeMo diarization did not produce an RTTM file in pred_rttms")
+
+        segments = _parse_rttm_file(rttm_path)
+
+        # Filter short segments
+        filtered: List[Dict[str, Any]] = []
+        for s in segments:
+            if (float(s["end"]) - float(s["start"])) >= float(min_segment_duration):
+                filtered.append(s)
+
+        # Load waveform once for cluster-audio concatenation
+        waveform, sr = torchaudio.load(wav_path)
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
-        
-        total_samples = waveform.shape[1]
-        duration = total_samples / sample_rate
-        window_samples = int(window_size * sample_rate)
-        hop_samples = int(window_hop * sample_rate)
-        
-        # Track unknown speaker clusters: {"unknown_1": {"centroid": ndarray, "count": int, "embeddings": []}}
-        unknown_clusters = {}
-        unknown_counter = 0
-        
-        # Window-level labels: [(start_time, end_time, speaker_label, confidence, similarity, vad_confidence)]
-        window_labels = []
-        
-        position = 0
-        while position < total_samples:
-            end_pos = min(position + window_samples, total_samples)
-            window = waveform[:, position:end_pos]
-            
-            # Skip windows that are too short
-            if window.shape[1] < sample_rate * 0.5:
-                break
-            
-            window_start = position / sample_rate
-            window_end = end_pos / sample_rate
-            
-            # VAD check - skip non-speech windows if VAD enabled
-            vad_confidence = None
-            skip_window = False
-            if vad is not None:
-                try:
-                    has_speech, vad_confidence, vad_speech_ratio = vad.get_speech_confidence(window, sample_rate)
-                    # Use lower threshold to avoid skipping too many windows
-                    if not has_speech or vad_confidence < 0.3:
-                        skip_window = True
-                except Exception as e:
-                    # If VAD fails, process the window anyway
-                    skip_window = False
-                    vad_confidence = 0.5
-            
-            if not skip_window:
-                # Extract ECAPA embedding for this window
-                try:
-                    with torch.no_grad():
-                        embedding = classifier.encode_batch(window)
-                        embedding = embedding.squeeze().cpu().numpy()
-                except Exception as e:
-                    # Skip this window if embedding extraction fails
-                    position += hop_samples
-                    continue
-                
-                # Try to match against known speakers
-                speaker_label = None
-                similarity = 0.0
-                confidence = 0.0
-                
-                if len(db) > 0:
-                    matches = db.query(embedding, top_k=1)
-                    if matches and matches[0]["similarity"] >= identify_threshold:
-                        speaker_label = matches[0]["name"]
-                        similarity = matches[0]["similarity"]
-                        confidence = matches[0]["similarity"]
-                
-                # If no known match, assign to unknown cluster
-                if speaker_label is None:
-                    best_unknown_cluster = None
-                    best_unknown_similarity = 0.0
-                    
-                    # Check against existing unknown clusters
-                    for cluster_id, cluster_data in unknown_clusters.items():
-                        centroid = cluster_data["centroid"]
-                        sim = cosine_similarity(embedding, centroid)
-                        if sim > best_unknown_similarity:
-                            best_unknown_similarity = sim
-                            best_unknown_cluster = cluster_id
-                    
-                    # Assign to existing cluster if similarity >= threshold
-                    if best_unknown_cluster and best_unknown_similarity >= unknown_assign_threshold:
-                        speaker_label = best_unknown_cluster
-                        similarity = best_unknown_similarity
-                        confidence = best_unknown_similarity
-                        
-                        # Update cluster centroid (running average)
-                        cluster_data = unknown_clusters[best_unknown_cluster]
-                        cluster_data["embeddings"].append(embedding)
-                        cluster_data["count"] += 1
-                        # Recompute centroid as average of all embeddings
-                        cluster_data["centroid"] = np.mean(cluster_data["embeddings"], axis=0)
-                        # Normalize centroid for cosine similarity
-                        cluster_data["centroid"] = cluster_data["centroid"] / np.linalg.norm(cluster_data["centroid"])
-                    else:
-                        # Create new unknown cluster
-                        unknown_counter += 1
-                        cluster_id = f"unknown_{unknown_counter}"
-                        speaker_label = cluster_id
-                        similarity = 1.0  # Perfect match to itself
-                        confidence = 0.5  # Moderate confidence for unknown
-                        
-                        unknown_clusters[cluster_id] = {
-                            "centroid": embedding.copy(),
-                            "count": 1,
-                            "embeddings": [embedding.copy()]
-                        }
-                
-                # Record window label
-                window_labels.append((
-                    window_start,
-                    window_end,
-                    speaker_label,
-                    confidence,
-                    similarity,
-                    vad_confidence
-                ))
-            
-            position += hop_samples
-        
-        # Merge consecutive windows with same speaker into segments
-        segments = []
-        if window_labels:
-            current_segment_start = window_labels[0][0]
-            current_segment_speaker = window_labels[0][2]
-            current_segment_confidences = [window_labels[0][3]]
-            current_segment_similarities = [window_labels[0][4]]
-            current_segment_vad = [window_labels[0][5]] if window_labels[0][5] is not None else []
-            
-            for i in range(1, len(window_labels)):
-                win_start, win_end, speaker, conf, sim, vad_conf = window_labels[i]
-                
-                # Check if same speaker continues
-                if speaker == current_segment_speaker:
-                    # Merge into current segment
-                    current_segment_confidences.append(conf)
-                    current_segment_similarities.append(sim)
-                    if vad_conf is not None:
-                        current_segment_vad.append(vad_conf)
-                else:
-                    # Speaker changed - close previous segment
-                    segment_end = window_labels[i-1][1]
-                    segment_duration = segment_end - current_segment_start
-                    
-                    # Only add if meets minimum duration
-                    if segment_duration >= min_segment_duration:
-                        avg_confidence = float(np.mean(current_segment_confidences))
-                        avg_similarity = float(np.mean(current_segment_similarities))
-                        avg_vad = float(np.mean(current_segment_vad)) if current_segment_vad else None
-                        
-                        segment = {
-                            "start": round(current_segment_start, 2),
-                            "end": round(segment_end, 2),
-                            "speaker": current_segment_speaker,
-                            "cause": "ts_vad",
-                            "confidence": round(avg_confidence, 3),
-                            "similarity": round(avg_similarity, 3)
-                        }
-                        if avg_vad is not None:
-                            segment["vad_confidence"] = round(avg_vad, 3)
-                        
-                        segments.append(segment)
-                    
-                    # Start new segment
-                    current_segment_start = win_start
-                    current_segment_speaker = speaker
-                    current_segment_confidences = [conf]
-                    current_segment_similarities = [sim]
-                    current_segment_vad = [vad_conf] if vad_conf is not None else []
-            
-            # Close final segment
-            segment_end = window_labels[-1][1]
-            segment_duration = segment_end - current_segment_start
-            
-            if segment_duration >= min_segment_duration:
-                avg_confidence = float(np.mean(current_segment_confidences))
-                avg_similarity = float(np.mean(current_segment_similarities))
-                avg_vad = float(np.mean(current_segment_vad)) if current_segment_vad else None
-                
-                segment = {
-                    "start": round(current_segment_start, 2),
-                    "end": round(segment_end, 2),
-                    "speaker": current_segment_speaker,
-                    "cause": "ts_vad",
-                    "confidence": round(avg_confidence, 3),
-                    "similarity": round(avg_similarity, 3)
-                }
-                if avg_vad is not None:
-                    segment["vad_confidence"] = round(avg_vad, 3)
-                
-                segments.append(segment)
-        
-        # Extract unique speakers
-        unknown_speakers = sorted([s["speaker"] for s in segments if s["speaker"] and s["speaker"].startswith("unknown_")])
-        unknown_speakers = list(dict.fromkeys(unknown_speakers))  # Remove duplicates while preserving order
-        
-        known_speakers = db.list_names()
-        
+
+        # Collect raw speakers
+        raw_speakers: List[str] = []
+        for s in filtered:
+            rs = s.get("raw_speaker")
+            if rs and rs not in raw_speakers:
+                raw_speakers.append(rs)
+
+        # Map raw speaker -> final label (known name or unknown_i)
+        speaker_map: Dict[str, Dict[str, Any]] = {}
+        unknown_idx = 0
+        for rs in raw_speakers:
+            cluster_wave, total_sec = _concat_waveform_for_speaker(
+                waveform, sr, filtered, rs, max_total_seconds=12.0
+            )
+            if cluster_wave is None or total_sec < float(min_cluster_audio_seconds):
+                # Not enough audio to identify reliably
+                unknown_idx += 1
+                speaker_map[rs] = {"label": f"unknown_{unknown_idx}", "similarity": 0.0}
+                continue
+
+            name, sim = _match_cluster_to_known(
+                classifier=classifier,
+                torch=torch,
+                cluster_wave=cluster_wave,
+                db=db,
+                identify_threshold=float(identify_threshold),
+            )
+            if name is not None:
+                speaker_map[rs] = {"label": name, "similarity": float(sim)}
+            else:
+                unknown_idx += 1
+                speaker_map[rs] = {"label": f"unknown_{unknown_idx}", "similarity": float(sim)}
+
+        # Apply mapping to segments
+        out_segments: List[Dict[str, Any]] = []
+        unknown_speakers: List[str] = []
+        for s in filtered:
+            rs = s.get("raw_speaker")
+            mapped = speaker_map.get(rs, {"label": None, "similarity": 0.0})
+            label = mapped.get("label")
+            sim = mapped.get("similarity", 0.0)
+            if isinstance(label, str) and label.startswith("unknown_") and label not in unknown_speakers:
+                unknown_speakers.append(label)
+
+            out_segments.append({
+                "start": s["start"],
+                "end": s["end"],
+                "speaker": label,
+                "cause": "ts_vad",
+                "confidence": None,
+                "similarity": round(float(sim), 3) if sim is not None else None,
+            })
+
         return {
             "mode": "ts_vad",
-            "duration": round(duration, 2),
-            "segments": segments,
+            "duration": round(float(duration), 2),
+            "segments": out_segments,
             "unknown_speakers": unknown_speakers,
-            "known_speakers": known_speakers
+            "known_speakers": known_speakers,
+            "backend": "nemo_msdd",
         }
-        
+
     finally:
-        if temp_input and os.path.exists(temp_input):
-            os.unlink(temp_input)
-        if temp_wav and os.path.exists(temp_wav):
-            os.unlink(temp_wav)
+        # Restore original torch.Tensor.view
+        torch.Tensor.view = _original_view
+        try:
+            import shutil
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def run_server(host, port, db_path, device="cpu", recordings_path=None):
@@ -1192,6 +1309,7 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
         chunk_size = float(request.form.get("chunk_size", 3.0))
         chunk_hop = float(request.form.get("chunk_hop", 0.5))
         threshold = float(request.form.get("threshold", 0.5))
+        identify_threshold = float(request.form.get("identify_threshold", threshold))
         change_threshold = float(request.form.get("change_threshold", 0.7))
         filter_unknown = request.form.get("filter_unknown", "false").lower() == "true"
         stream = request.form.get("stream", "false").lower() == "true"
@@ -1203,7 +1321,7 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
         diarization_mode = request.form.get("diarization_mode", "coarse")
         window_size = float(request.form.get("window_size", 2.0))
         window_hop = float(request.form.get("window_hop", 0.5))
-        unknown_assign_threshold = float(request.form.get("unknown_assign_threshold", 0.60))
+        unknown_assign_threshold = float(request.form.get("unknown_assign_threshold", 0.75))
         min_segment_duration = float(request.form.get("min_segment_duration", 0.5))
         
         try:
@@ -1218,18 +1336,67 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                     response.headers['Cache-Control'] = 'no-cache'
                     return response
                 elif diarization_mode == "ts_vad":
-                    # TS-VAD refinement mode - non-streaming batch with window-based analysis
-                    vad = get_vad(vad_threshold) if use_vad else None
-                    result = ts_vad_refine(
-                        audio_bytes, classifier, torchaudio, torch, db,
-                        vad=vad,
-                        window_size=window_size,
-                        window_hop=window_hop,
-                        identify_threshold=threshold,
-                        unknown_assign_threshold=unknown_assign_threshold,
-                        min_segment_duration=min_segment_duration
-                    )
-                    return jsonify(result)
+                    # TS-VAD refinement mode - non-streaming batch.
+                    # Only use NeMo MSDD diarization + known-speaker naming. No fallback.
+                    temp_input = None
+                    temp_wav = None
+                    try:
+                        # Write bytes to temp file
+                        fd, temp_input = tempfile.mkstemp()
+                        os.write(fd, audio_bytes)
+                        os.close(fd)
+
+                        # Convert through ffmpeg to 16kHz mono WAV
+                        fd2, temp_wav = tempfile.mkstemp(suffix='.wav')
+                        os.close(fd2)
+                        conv = subprocess.run(
+                            ['ffmpeg', '-i', temp_input, '-ar', '16000', '-ac', '1', '-y', temp_wav],
+                            capture_output=True,
+                            text=True
+                        )
+                        if conv.returncode != 0:
+                            raise RuntimeError(f"ffmpeg conversion failed: {conv.stderr}")
+
+                        # Get duration
+                        wf, sr = torchaudio.load(temp_wav)
+                        if wf.shape[0] > 1:
+                            wf = torch.mean(wf, dim=0, keepdim=True)
+                        dur = float(wf.shape[1] / sr)
+
+                        # Debug logging
+                        audio_min, audio_max = float(wf.min()), float(wf.max())
+                        audio_mean = float(wf.abs().mean())
+                        print(f"[TS-VAD] Duration: {dur:.2f}s | Shape: {wf.shape} | SR: {sr}", file=sys.stderr)
+                        print(f"[TS-VAD] Amplitude - min: {audio_min:.4f}, max: {audio_max:.4f}, mean: {audio_mean:.4f}", file=sys.stderr)
+                        
+                        if dur < 2.0:
+                            return jsonify({"error": f"Recording too short for TS-VAD (got {dur:.1f}s, need ≥2s)"}), 400
+
+                        try:
+                            # Run NeMo MSDD diarization + known-speaker naming
+                            result = nemo_ts_vad_refine(
+                                wav_path=temp_wav,
+                                duration=dur,
+                                known_speakers=db.list_names(),
+                                classifier=classifier,
+                                torchaudio=torchaudio,
+                                torch=torch,
+                                db=db,
+                                identify_threshold=identify_threshold,
+                                min_segment_duration=min_segment_duration,
+                                device=device,
+                            )
+                            return jsonify(result)
+                        except ImportError as ie:
+                            return jsonify({
+                                "error": "NeMo diarization is not installed/enabled on this server",
+                                "details": str(ie),
+                            }), 400
+                    finally:
+                        if temp_input and os.path.exists(temp_input):
+                            os.unlink(temp_input)
+                        if temp_wav and os.path.exists(temp_wav):
+                            os.unlink(temp_wav)
                 else:
                     # Batch response (coarse mode)
                     result = diarize_audio_bytes(
