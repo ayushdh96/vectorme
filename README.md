@@ -9,12 +9,15 @@ Watch a video: https://youtu.be/-kvUzvcfD6o
 
 ## Features
 
-- **Speaker Embeddings**: Extract 192-dimensional speaker embeddings
-- **Speaker Database**: Store and query known speakers
-- **Diarization**: Process audio in chunks to identify who is speaking when
-- **HTTP Server**: REST API with streaming support
-- **Format Support**: WAV, M4A, MP3, AAC, FLAC, OGG, and more (via ffmpeg)
+- **Speaker Embeddings**: Extract 192-dimensional speaker embeddings using ECAPA-TDNN
+- **Speaker Database**: Store and query known speakers with vector similarity search
+- **Real-time Diarization**: Live streaming speaker detection with confidence scores
+- **TS-VAD Refinement**: NeMo MSDD-based batch diarization with precise speaker boundaries
+- **Web UI**: React-based voice recorder with live waveform visualization and speaker timeline
+- **HTTP Server**: REST API with OpenAI-compatible endpoints and streaming support
+- **Format Support**: WAV, M4A, MP3, AAC, FLAC, OGG, WebM, and more (via ffmpeg)
 - **GPU Acceleration**: CUDA and Metal (MPS) support
+- **CPU Compatibility**: Automatic tensor layout fixes for CPU-based NeMo MSDD processing
 
 ## Installation
 
@@ -162,17 +165,29 @@ vectorme --file audio.wav --format numpy > embedding.npy
 
 ## HTTP Server
 
-Run vectorme as an HTTP server for integration with other applications:
+Run vectorme as an HTTP server with web UI for voice recording and speaker analysis:
 
 ```bash
 vectorme --serve
 # Starting server on 127.0.0.1:3120
+# Open http://localhost:3120 in your browser
 ```
 
 **Options:**
 ```bash
 vectorme --serve --host 0.0.0.0 --port 8080 --gpu
 ```
+
+### Web UI
+
+The web interface provides:
+- **Real-time recording** with live waveform visualization
+- **Streaming diarization** with instant speaker detection
+- **Interactive audio timeline** showing speaker segments
+- **Drag-to-select** audio regions for focused analysis
+- **Speaker labeling** interface for naming unknown speakers
+- **Saved recordings** library with shareable links
+- **Multi-scale embeddings** with confidence scores
 
 ### API Endpoints
 
@@ -237,9 +252,9 @@ Real-time NDJSON output:
 ```
 
 **Event fields:**
-- `segment.vad_confidence` - Average VAD speech probability for the segment (0.0-1.0, only when VAD enabled)
-- `speaker_change.vad_confidence` - VAD confidence at the speaker change point (only when VAD enabled)
+- `segment.vad_confidence` - A (NeMo MSDD)
 
+TS-VAD uses NeMo's Multi-Scale Diarization Decoder (MSDD) for advanced batch diarization with precise speaker boundaries and intelligent unknown speaker clustering
 **Additional parameters:**
 - `chunk_size` - Chunk duration in seconds (default: 3.0, matches ECAPA-TDNN training)
 - `chunk_hop` - Hop between chunks (default: 0.5)
@@ -248,6 +263,80 @@ Real-time NDJSON output:
 - `filter_unknown=true` - Hide segments with unknown speakers
 - `vad=false` - Disable Voice Activity Detection (enabled by default)
 - `vad_threshold` - VAD speech probability threshold (default: 0.5)
+
+### TS-VAD Refined Diarization (NeMo MSDD)
+
+TS-VAD uses NeMo's NeuralDiarizer with Multi-Scale Diarization Decoder (MSDD) for advanced batch diarization with precise speaker boundaries and intelligent unknown speaker clustering.
+
+**NeMo Integration:**
+- **NeuralDiarizer**: NVIDIA NeMo's end-to-end diarization pipeline
+- **MSDD Model**: Multi-scale temporal modeling with `diar_msdd_telephonic` weights
+- **VAD**: MarbleNet voice activity detection (`vad_marblenet`)
+- **Embeddings**: TitaNet/ECAPA-TDNN speaker embeddings with multi-scale windows
+- **CPU Compatibility**: Automatic tensor layout fixes via `.reshape()` fallback for CPU execution
+
+**Key differences from streaming diarization:**
+- **Batch processing**: Analyzes the entire audio file instead of streaming chunks
+- **Multi-scale embeddings**: 5 temporal scales (0.5s to 1.5s windows) for robust speaker modeling
+- **Unknown speaker clustering**: Groups unidentified segments into `unknown_1`, `unknown_2`, etc. based on voice similarity
+- **Precise timestamps**: MSDD refinement provides more accurate speaker change boundaries
+
+**Enable TS-VAD mode:**
+```bash
+curl -X POST http://localhost:3120/v1/audio/transcriptions \
+  -F "file=@conversation.m4a" \
+  -F "response_format=diarized_json" \
+  -F "diarization_mode=ts_vad"
+```
+
+**TS-VAD-specific parameters:**
+- `diarization_mode=ts_vad` - Enable TS-VAD refinement (default: `streaming`)
+- `window_size` - Analysis window duration in seconds (default: 2.0)
+- `window_hop` - Hop between windows in seconds (default: 0.5)
+- `unknown_assign_threshold` - Similarity threshold for grouping unknown speakers (default: 0.60)
+- `min_segment_duration` - Minimum segment length in seconds (default: 0.5)
+
+**TS-VAD Response:**
+```json
+{
+  "mode": "ts_vad",
+  "duration": 59.07,
+  "segments": [
+    {"start": 0.0, "end": 3.2, "speaker": "Ayush", "similarity": 0.78, "vad_confidence": 0.91},
+    {"start": 3.2, "end": 7.5, "speaker": "unknown_1", "similarity": 0.42, "vad_confidence": 0.85},
+    {"start": 7.5, "end": 12.1, "speaker": "Doug", "similarity": 0.82, "vad_confidence": 0.89}
+  ],
+  "known_speakers": ["Ayush", "Doug"],
+  "unknown_speakers": ["unknown_1"],
+  "total_segments": 3
+}
+```
+
+**Unknown speaker handling:**
+- Segments with similarity below `threshold` (0.5) are marked as unknown
+- Unknown segments are clustered by voice similarity
+- Each cluster gets a unique ID: `unknown_1`, `unknown_2`, etc.
+- Similar-sounding unknowns are grouped together (controlled by `unknown_assign_threshold`)
+
+**Web UI features:**
+- Real-time speaker detection during recording with live waveform visualization
+- Confidence scores for each speaker identification
+- Color-coded similarity indicators (green ≥70%, yellow 50-69%, red <50%)
+- Speaker labeling interface for unknown speakers
+- Drag-to-select audio regions for focused analysis
+
+**CLI example with all parameters:**
+```bash
+curl -X POST http://localhost:3120/v1/audio/transcriptions \
+  -F "file=@meeting.m4a" \
+  -F "response_format=diarized_json" \
+  -F "diarization_mode=ts_vad" \
+  -F "window_size=2.0" \
+  -F "window_hop=0.5" \
+  -F "unknown_assign_threshold=0.60" \
+  -F "vad=true" \
+  -F "threshold=0.5"
+```
 
 ## About ECAPA-TDNN
 
@@ -270,3 +359,33 @@ The pretrained `speechbrain/spkrec-ecapa-voxceleb` model was trained on **fixed-
 References:
 - [SpeechBrain ECAPA recipe](https://github.com/speechbrain/speechbrain/blob/develop/recipes/VoxCeleb/SpeakerRec/hparams/train_ecapa_tdnn.yaml)
 - [Model card](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb)
+## Frontend Architecture
+
+The web UI is built with a modular, no-build-step architecture for rapid development:
+
+### File Structure
+- **`static/index.html`** (26 lines) - Minimal HTML shell with CDN imports
+- **`static/styles.css`** (692 lines) - Complete styling with responsive design and SASS-ready structure
+- **`static/app.js`** (1767 lines) - React component with JSX transpiled in-browser via Babel
+
+### Technology Stack
+- **React 18** - Loaded via unpkg CDN, no build step required
+- **WaveSurfer.js 7** - Audio waveform visualization and region selection
+- **Babel Standalone** - Client-side JSX transformation for rapid iteration
+- **MediaRecorder API** - WebM/Opus recording with 1-second chunks for streaming
+- **Fetch Streaming** - NDJSON event stream processing for real-time updates
+
+### Key Features
+- **Zero build complexity**: Edit app.js and refresh - changes appear instantly
+- **Semantic CSS**: All elements use meaningful class names (`.segment-speaker`, `.timeline-info`)
+- **Modular separation**: HTML structure, styling, and logic cleanly separated
+- **ARIA accessibility**: Full screen reader support with proper labeling
+- **Responsive design**: Mobile-optimized with breakpoints at 768px and 480px
+
+### Development Workflow
+1. Edit `static/app.js` for logic changes
+2. Edit `static/styles.css` for styling
+3. Refresh browser - no build required
+4. Changes persist immediately with Flask auto-reload
+
+This architecture enables rapid prototyping while maintaining production-ready code organization.

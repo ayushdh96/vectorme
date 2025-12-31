@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 import numpy as np
+from typing import Optional, List, Dict, Any, Tuple
 
 # Suppress noisy warnings from dependencies
 os.environ["PYTHONWARNINGS"] = "ignore"
@@ -557,6 +558,376 @@ def diarize_audio_bytes(audio_bytes, classifier, torchaudio, torch, db,
             os.unlink(temp_wav)
 
 
+
+
+
+# ------------------- NeMo MSDD diarization + known-speaker naming -------------------
+
+def _nemo_create_msdd_config(
+    work_dir: str,
+    wav_path: str,
+    duration: float,
+    device: str,
+    domain_type: str = "telephonic",
+) -> "OmegaConf":
+    """Create a NeMo diarization config from the local YAML file and override runtime fields.
+
+    This mirrors the approach used in your `diarize.py` (NeuralDiarizer(cfg=create_config(...)).to(device)).
+    We keep it offline diarization only (no transcription).
+    """
+    from omegaconf import OmegaConf
+
+    # Local YAML should live next to this file under nemo_msdd_configs/
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    cfg_path = os.path.join(base_dir, "nemo_msdd_configs", f"diar_infer_{domain_type}.yaml")
+    if not os.path.exists(cfg_path):
+        raise FileNotFoundError(
+            f"NeMo diarization config not found at {cfg_path}. "
+            "Create it under vectorme/nemo_msdd_configs/diar_infer_telephonic.yaml"
+        )
+
+    cfg = OmegaConf.load(cfg_path)
+
+    # Some NeMo diarization configs are structured; if the YAML is missing a root `device` key,
+    # NeMo may crash when it tries to access cfg.device. Ensure it exists.
+    try:
+        has_device_key = ("device" in cfg)
+    except Exception:
+        has_device_key = hasattr(cfg, "device")
+
+    if not has_device_key:
+        # Temporarily disable struct to allow inserting missing keys
+        try:
+            OmegaConf.set_struct(cfg, False)
+        except Exception:
+            pass
+        cfg.device = None
+        try:
+            OmegaConf.set_struct(cfg, True)
+        except Exception:
+            pass
+
+    data_dir = os.path.join(work_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+
+    # NeMo diarization expects a manifest JSONL
+    manifest_path = os.path.join(data_dir, "input_manifest.json")
+    meta = {
+        "audio_filepath": wav_path,
+        "offset": 0,
+        "duration": float(duration) if duration else None,
+        "label": "infer",
+        "text": "-",
+        "rttm_filepath": None,
+        "uem_filepath": None,
+    }
+    with open(manifest_path, "w", encoding="utf-8") as fp:
+        fp.write(json.dumps(meta) + "\n")
+
+    # Override runtime fields
+    cfg.num_workers = 0
+    cfg.diarizer.manifest_filepath = manifest_path
+    cfg.diarizer.out_dir = work_dir
+
+    # Set device only if the config supports it (we ensured the key exists above).
+    # NeuralDiarizer will also be moved to the device via `.to(device)`.
+    try:
+        cfg.device = str(device) if device else None
+    except Exception:
+        pass
+
+    # Ensure we don't accidentally run ASR
+    if "asr" in cfg.diarizer:
+        cfg.diarizer.asr.model_path = None
+
+    return cfg
+
+def _parse_rttm_file(rttm_path: str) -> List[Dict[str, Any]]:
+    """Parse an RTTM file into a list of segments.
+
+    RTTM format: SPEAKER <file-id> 1 <start> <dur> <...> <speaker-id> <...>
+    """
+    segments: List[Dict[str, Any]] = []
+    try:
+        with open(rttm_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 9:
+                    continue
+                if parts[0].upper() != "SPEAKER":
+                    continue
+                start = float(parts[3])
+                dur = float(parts[4])
+                spk = parts[7]
+                end = start + dur
+                segments.append({
+                    "start": start,
+                    "end": end,
+                    "speaker": spk,
+                    "raw_speaker": spk,
+                    "cause": "ts_vad",
+                    "confidence": None,
+                    "similarity": None,
+                })
+    except FileNotFoundError:
+        return []
+
+    # Sort and merge consecutive segments with same label (simple cleanup)
+    segments.sort(key=lambda x: (x["start"], x["end"]))
+    merged: List[Dict[str, Any]] = []
+    for s in segments:
+        if not merged:
+            merged.append(s)
+            continue
+        prev = merged[-1]
+        if prev["speaker"] == s["speaker"] and s["start"] <= prev["end"] + 1e-3:
+            prev["end"] = max(prev["end"], s["end"])
+            # preserve raw_speaker
+            prev["raw_speaker"] = prev["raw_speaker"]
+        else:
+            merged.append(s)
+
+    # Round for API consistency
+    for s in merged:
+        s["start"] = round(float(s["start"]), 2)
+        s["end"] = round(float(s["end"]), 2)
+        # Do NOT round or remove raw_speaker
+    return merged
+
+
+# --- Helper functions for NeMo MSDD + known-speaker naming ---
+def _normalize_vec(v: np.ndarray) -> np.ndarray:
+    v = np.array(v, dtype=np.float32).flatten()
+    n = np.linalg.norm(v)
+    return v / n if n > 0 else v
+
+
+def _concat_waveform_for_speaker(
+    waveform,
+    sample_rate: int,
+    segments: List[Dict[str, Any]],
+    raw_speaker: str,
+    max_total_seconds: float = 12.0,
+) -> Tuple[Optional[Any], float]:
+    """Concatenate audio for a given RTTM raw speaker id.
+
+    Returns (concat_waveform, total_seconds).
+    waveform is a torch Tensor shaped [1, T].
+    """
+    import torch
+
+    pieces = []
+    total = 0.0
+    for s in segments:
+        if s.get("raw_speaker") != raw_speaker:
+            continue
+        start = float(s["start"])
+        end = float(s["end"])
+        dur = max(0.0, end - start)
+        if dur <= 0:
+            continue
+        if total >= max_total_seconds:
+            break
+        # Clamp to remaining budget
+        take = min(dur, max_total_seconds - total)
+        a0 = int(start * sample_rate)
+        a1 = int((start + take) * sample_rate)
+        if a1 <= a0:
+            continue
+        pieces.append(waveform[:, a0:a1])
+        total += take
+
+    if not pieces:
+        return None, 0.0
+
+    return torch.cat(pieces, dim=1), total
+
+
+def _match_cluster_to_known(
+    classifier,
+    torch,
+    cluster_wave,
+    db: 'VectorDB',
+    identify_threshold: float,
+) -> Tuple[Optional[str], float]:
+    """Compute ECAPA embedding for cluster audio and match to VectorDB."""
+    with torch.no_grad():
+        emb = classifier.encode_batch(cluster_wave)
+        emb = _normalize_vec(emb.squeeze().cpu().numpy())
+
+    if len(db) == 0:
+        return None, 0.0
+
+    res = db.query(emb, top_k=1)
+    if res and res[0]["similarity"] >= identify_threshold:
+        return res[0]["name"], float(res[0]["similarity"])
+    return None, float(res[0]["similarity"]) if res else 0.0
+
+
+
+
+def nemo_ts_vad_refine(
+    wav_path: str,
+    duration: float,
+    known_speakers: List[str],
+    classifier,
+    torchaudio,
+    torch,
+    db: 'VectorDB',
+    identify_threshold: float = 0.5,
+    min_segment_duration: float = 0.3,
+    min_cluster_audio_seconds: float = 1.2,
+    device: str = "cpu",
+) -> Dict[str, Any]:
+    """Run NeMo MSDD diarization (TS-VAD-style refinement) and then map diarized speakers to known names.
+
+    - Stage 1: NeMo diarization -> RTTM segments with raw speaker ids.
+    - Stage 2: For each raw speaker id, concatenate that speaker's audio and compute an ECAPA embedding.
+               Match embedding against VectorDB; if match >= identify_threshold, rename to known speaker.
+               Otherwise assign stable unknown_1, unknown_2, ...
+
+    Returns API schema compatible with the frontend: {mode, duration, segments, unknown_speakers, known_speakers, backend}
+    """
+    from omegaconf import OmegaConf
+
+    try:
+        from nemo.collections.asr.models import NeuralDiarizer
+    except Exception as e:
+        raise ImportError("NeMo diarization (NeuralDiarizer) not available") from e
+
+    # Monkey-patch torch.Tensor.view to use reshape for CPU compatibility
+    # This fixes "view size is not compatible with input tensor's size and stride" errors
+    _original_view = torch.Tensor.view
+    def _safe_view(self, *args):
+        try:
+            return _original_view(self, *args)
+        except RuntimeError:
+            return self.reshape(*args)
+    torch.Tensor.view = _safe_view
+
+    work_dir = tempfile.mkdtemp(prefix="nemo_msdd_")
+    try:
+        # Build NeMo config from local YAML and override runtime paths
+        diarizer_cfg = _nemo_create_msdd_config(
+            work_dir=work_dir,
+            wav_path=wav_path,
+            duration=float(duration),
+            device=str(device),
+            domain_type="telephonic",
+        )
+
+        # Run diarization (MSDD enabled via YAML)
+        msdd_model = NeuralDiarizer(cfg=diarizer_cfg).to(str(device))
+        # Some NeMo versions keep a nested _cfg; ensure paths are consistent
+        try:
+            msdd_model._cfg.diarizer.manifest_filepath = diarizer_cfg.diarizer.manifest_filepath
+            msdd_model._cfg.diarizer.out_dir = diarizer_cfg.diarizer.out_dir
+        except Exception:
+            pass
+
+        msdd_model.diarize()
+
+        # NeMo usually writes RTTM under <out_dir>/pred_rttms/mono_file.rttm or <uniq_id>.rttm.
+        # We don't control uniq_id here, so search pred_rttms for the first RTTM.
+        rttm_dir = os.path.join(work_dir, "pred_rttms")
+        rttm_path = None
+        if os.path.isdir(rttm_dir):
+            for fn in os.listdir(rttm_dir):
+                if fn.lower().endswith(".rttm"):
+                    rttm_path = os.path.join(rttm_dir, fn)
+                    break
+
+        if not rttm_path or not os.path.exists(rttm_path):
+            raise RuntimeError("NeMo diarization did not produce an RTTM file in pred_rttms")
+
+        segments = _parse_rttm_file(rttm_path)
+
+        # Filter short segments
+        filtered: List[Dict[str, Any]] = []
+        for s in segments:
+            if (float(s["end"]) - float(s["start"])) >= float(min_segment_duration):
+                filtered.append(s)
+
+        # Load waveform once for cluster-audio concatenation
+        waveform, sr = torchaudio.load(wav_path)
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        # Collect raw speakers
+        raw_speakers: List[str] = []
+        for s in filtered:
+            rs = s.get("raw_speaker")
+            if rs and rs not in raw_speakers:
+                raw_speakers.append(rs)
+
+        # Map raw speaker -> final label (known name or unknown_i)
+        speaker_map: Dict[str, Dict[str, Any]] = {}
+        unknown_idx = 0
+        for rs in raw_speakers:
+            cluster_wave, total_sec = _concat_waveform_for_speaker(
+                waveform, sr, filtered, rs, max_total_seconds=12.0
+            )
+            if cluster_wave is None or total_sec < float(min_cluster_audio_seconds):
+                # Not enough audio to identify reliably
+                unknown_idx += 1
+                speaker_map[rs] = {"label": f"unknown_{unknown_idx}", "similarity": 0.0}
+                continue
+
+            name, sim = _match_cluster_to_known(
+                classifier=classifier,
+                torch=torch,
+                cluster_wave=cluster_wave,
+                db=db,
+                identify_threshold=float(identify_threshold),
+            )
+            if name is not None:
+                speaker_map[rs] = {"label": name, "similarity": float(sim)}
+            else:
+                unknown_idx += 1
+                speaker_map[rs] = {"label": f"unknown_{unknown_idx}", "similarity": float(sim)}
+
+        # Apply mapping to segments
+        out_segments: List[Dict[str, Any]] = []
+        unknown_speakers: List[str] = []
+        for s in filtered:
+            rs = s.get("raw_speaker")
+            mapped = speaker_map.get(rs, {"label": None, "similarity": 0.0})
+            label = mapped.get("label")
+            sim = mapped.get("similarity", 0.0)
+            if isinstance(label, str) and label.startswith("unknown_") and label not in unknown_speakers:
+                unknown_speakers.append(label)
+
+            out_segments.append({
+                "start": s["start"],
+                "end": s["end"],
+                "speaker": label,
+                "cause": "ts_vad",
+                "confidence": None,
+                "similarity": round(float(sim), 3) if sim is not None else None,
+            })
+
+        return {
+            "mode": "ts_vad",
+            "duration": round(float(duration), 2),
+            "segments": out_segments,
+            "unknown_speakers": unknown_speakers,
+            "known_speakers": known_speakers,
+            "backend": "nemo_msdd",
+        }
+
+    finally:
+        # Restore original torch.Tensor.view
+        torch.Tensor.view = _original_view
+        try:
+            import shutil
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def run_server(host, port, db_path, device="cpu", recordings_path=None):
     """Run HTTP server for audio diarization."""
     from flask import Flask, request, jsonify, Response, send_from_directory, send_file
@@ -606,9 +977,11 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
         
         # Dynamic threshold based on VAD confidence
         # High VAD = confident speech, so we can trust lower similarity matches
+        # When VAD is disabled (segment_vad is None), use a low default threshold
         def get_effective_threshold(segment_vad, base_threshold):
             if segment_vad is None:
-                return base_threshold
+                # VAD disabled - use a lower threshold to be more permissive
+                return max(0.40, base_threshold - 0.10)
             if segment_vad >= 0.7:
                 # High VAD confidence - speech is clear, lower threshold
                 return max(0.35, base_threshold - 0.15)
@@ -656,7 +1029,7 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
             
             # Minimum VAD confidence required to attempt speaker identification
             # Segments below this are likely noise/silence and shouldn't be identified
-            min_vad_for_identification = 0.4
+            min_vad_for_identification = 0.1
             
             # Accumulated embedding for current segment (more accurate than single chunk)
             # Weight embeddings by VAD confidence so noise contributes less
@@ -706,11 +1079,13 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                                     segment_vad = prev_vad_confidence if prev_vad_confidence is not None else 0.0
                                 
                                 # Skip segment entirely if VAD is too low (just noise/silence, not speech)
-                                if segment_vad < min_vad_for_identification:
+                                # Only apply VAD filtering if VAD is actually enabled
+                                if vad is not None and segment_vad < min_vad_for_identification:
                                     # Don't emit segment - it's just noise
                                     pass
                                 else:
-                                    # Only try to identify speaker if VAD is high enough
+                                    # Try to identify speaker
+                                    final_similarity = 0.0
                                     if segment_waveform.shape[1] >= sample_rate * 0.5 and len(db) > 0:
                                         with torch.no_grad():
                                             full_segment_embedding = classifier.encode_batch(segment_waveform)
@@ -719,15 +1094,19 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                                         # Use dynamic threshold - high VAD = confident speech = lower threshold
                                         effective_threshold = get_effective_threshold(segment_vad, threshold)
                                         final_speaker = results[0]["name"] if results and results[0]["similarity"] > effective_threshold else None
+                                        final_similarity = results[0]["similarity"] if results else 0.0
                                     
                                     if not filter_unknown or final_speaker is not None:
-                                        yield json.dumps({
+                                        segment_data = {
                                             "event": "segment",
                                             "start": round(segment_start, 2),
                                             "end": round(current_time, 2),
                                             "speaker": final_speaker,
-                                            "vad_confidence": round(segment_vad, 3)
-                                        }) + "\n"
+                                            "similarity": round(final_similarity, 3) if final_similarity else None
+                                        }
+                                        if vad is not None:
+                                            segment_data["vad_confidence"] = round(segment_vad, 3)
+                                        yield json.dumps(segment_data) + "\n"
                                 accumulated_embedding = None
                                 accumulated_weight = 0.0
                                 best_embedding = None
@@ -782,9 +1161,12 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                         if vad is not None and segment_waveform.shape[1] >= sample_rate * 0.5:
                             _, segment_vad, _ = vad.get_speech_confidence(segment_waveform, sample_rate)
                         else:
-                            segment_vad = prev_vad_confidence if prev_vad_confidence is not None else 0.0
-                        # Only try to identify speaker if VAD is high enough
-                        if segment_vad >= min_vad_for_identification and segment_waveform.shape[1] >= sample_rate * 0.5 and len(db) > 0:
+                            segment_vad = None  # None means VAD is disabled
+                        
+                        # Only try to identify speaker if VAD is high enough (or VAD is disabled)
+                        # When VAD is disabled (segment_vad is None), always try to identify
+                        vad_ok = segment_vad is None or segment_vad >= min_vad_for_identification
+                        if vad_ok and segment_waveform.shape[1] >= sample_rate * 0.5 and len(db) > 0:
                             with torch.no_grad():
                                 full_segment_embedding = classifier.encode_batch(segment_waveform)
                                 full_segment_embedding = full_segment_embedding.squeeze().cpu().numpy()
@@ -795,15 +1177,17 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                             final_similarity = results[0]["similarity"] if results else 0.0
                         
                         # Skip segment entirely if VAD is too low (just noise/silence)
-                        if segment_vad >= min_vad_for_identification:
+                        # Only apply VAD filtering if VAD is actually enabled
+                        if vad is None or segment_vad >= min_vad_for_identification:
                             if not filter_unknown or final_speaker is not None:
                                 segment_data = {
                                     "event": "segment",
                                     "start": round(segment_start, 2),
                                     "end": round(current_time, 2),
-                                    "speaker": final_speaker
+                                    "speaker": final_speaker,
+                                    "similarity": round(final_similarity, 3) if final_similarity else None
                                 }
-                                if prev_vad_confidence is not None:
+                                if vad is not None and prev_vad_confidence is not None:
                                     segment_data["vad_confidence"] = round(prev_vad_confidence, 3)
                                 yield json.dumps(segment_data) + "\n"
                     
@@ -875,11 +1259,14 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                 if vad is not None and segment_waveform.shape[1] >= sample_rate * 0.5:
                     _, segment_vad, _ = vad.get_speech_confidence(segment_waveform, sample_rate)
                 else:
-                    segment_vad = prev_vad_confidence if prev_vad_confidence is not None else 0.0
+                    segment_vad = None  # None means VAD is disabled
                 
                 # Skip segment entirely if VAD is too low (just noise/silence)
-                if segment_vad >= min_vad_for_identification:
-                    # Only try to identify speaker if VAD is high enough
+                # Only apply VAD filtering if VAD is actually enabled
+                vad_ok = segment_vad is None or segment_vad >= min_vad_for_identification
+                if vad_ok:
+                    # Try to identify speaker
+                    final_similarity = 0.0
                     if segment_waveform.shape[1] >= sample_rate * 0.5 and len(db) > 0:
                         with torch.no_grad():
                             full_segment_embedding = classifier.encode_batch(segment_waveform)
@@ -888,13 +1275,15 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                         # Use dynamic threshold - high VAD = confident speech = lower threshold
                         effective_threshold = get_effective_threshold(segment_vad, threshold)
                         final_speaker = results[0]["name"] if results and results[0]["similarity"] > effective_threshold else None
+                        final_similarity = results[0]["similarity"] if results else 0.0
                     
                     if not filter_unknown or final_speaker is not None:
                         segment_data = {
                             "event": "segment",
                             "start": round(segment_start, 2),
                             "end": round(duration, 2),
-                            "speaker": final_speaker
+                            "speaker": final_speaker,
+                            "similarity": round(final_similarity, 3) if final_similarity else None
                         }
                         if prev_vad_confidence is not None:
                             segment_data["vad_confidence"] = round(prev_vad_confidence, 3)
@@ -920,12 +1309,20 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
         chunk_size = float(request.form.get("chunk_size", 3.0))
         chunk_hop = float(request.form.get("chunk_hop", 0.5))
         threshold = float(request.form.get("threshold", 0.5))
+        identify_threshold = float(request.form.get("identify_threshold", threshold))
         change_threshold = float(request.form.get("change_threshold", 0.7))
         filter_unknown = request.form.get("filter_unknown", "false").lower() == "true"
         stream = request.form.get("stream", "false").lower() == "true"
         # VAD enabled by default for diarization, use vad=false to disable
         use_vad = request.form.get("vad", "true").lower() != "false"
         vad_threshold = float(request.form.get("vad_threshold", 0.5))
+        
+        # TS-VAD refinement mode parameters
+        diarization_mode = request.form.get("diarization_mode", "coarse")
+        window_size = float(request.form.get("window_size", 2.0))
+        window_hop = float(request.form.get("window_hop", 0.5))
+        unknown_assign_threshold = float(request.form.get("unknown_assign_threshold", 0.75))
+        min_segment_duration = float(request.form.get("min_segment_duration", 0.5))
         
         try:
             if response_format == "diarized_json":
@@ -938,8 +1335,70 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                     response.headers['X-Accel-Buffering'] = 'no'
                     response.headers['Cache-Control'] = 'no-cache'
                     return response
+                elif diarization_mode == "ts_vad":
+                    # TS-VAD refinement mode - non-streaming batch.
+                    # Only use NeMo MSDD diarization + known-speaker naming. No fallback.
+                    temp_input = None
+                    temp_wav = None
+                    try:
+                        # Write bytes to temp file
+                        fd, temp_input = tempfile.mkstemp()
+                        os.write(fd, audio_bytes)
+                        os.close(fd)
+
+                        # Convert through ffmpeg to 16kHz mono WAV
+                        fd2, temp_wav = tempfile.mkstemp(suffix='.wav')
+                        os.close(fd2)
+                        conv = subprocess.run(
+                            ['ffmpeg', '-i', temp_input, '-ar', '16000', '-ac', '1', '-y', temp_wav],
+                            capture_output=True,
+                            text=True
+                        )
+                        if conv.returncode != 0:
+                            raise RuntimeError(f"ffmpeg conversion failed: {conv.stderr}")
+
+                        # Get duration
+                        wf, sr = torchaudio.load(temp_wav)
+                        if wf.shape[0] > 1:
+                            wf = torch.mean(wf, dim=0, keepdim=True)
+                        dur = float(wf.shape[1] / sr)
+
+                        # Debug logging
+                        audio_min, audio_max = float(wf.min()), float(wf.max())
+                        audio_mean = float(wf.abs().mean())
+                        print(f"[TS-VAD] Duration: {dur:.2f}s | Shape: {wf.shape} | SR: {sr}", file=sys.stderr)
+                        print(f"[TS-VAD] Amplitude - min: {audio_min:.4f}, max: {audio_max:.4f}, mean: {audio_mean:.4f}", file=sys.stderr)
+                        
+                        if dur < 2.0:
+                            return jsonify({"error": f"Recording too short for TS-VAD (got {dur:.1f}s, need ≥2s)"}), 400
+
+                        try:
+                            # Run NeMo MSDD diarization + known-speaker naming
+                            result = nemo_ts_vad_refine(
+                                wav_path=temp_wav,
+                                duration=dur,
+                                known_speakers=db.list_names(),
+                                classifier=classifier,
+                                torchaudio=torchaudio,
+                                torch=torch,
+                                db=db,
+                                identify_threshold=identify_threshold,
+                                min_segment_duration=min_segment_duration,
+                                device=device,
+                            )
+                            return jsonify(result)
+                        except ImportError as ie:
+                            return jsonify({
+                                "error": "NeMo diarization is not installed/enabled on this server",
+                                "details": str(ie),
+                            }), 400
+                    finally:
+                        if temp_input and os.path.exists(temp_input):
+                            os.unlink(temp_input)
+                        if temp_wav and os.path.exists(temp_wav):
+                            os.unlink(temp_wav)
                 else:
-                    # Batch response
+                    # Batch response (coarse mode)
                     result = diarize_audio_bytes(
                         audio_bytes, classifier, torchaudio, torch, db,
                         chunk_size=chunk_size,
