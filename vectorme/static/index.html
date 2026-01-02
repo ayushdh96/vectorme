@@ -717,11 +717,13 @@
             const [audioBlob, setAudioBlob] = useState(null);
             const [duration, setDuration] = useState(0);
             const [segments, setSegments] = useState([]);
+            const [refinedSegments, setRefinedSegments] = useState([]); // TS-VAD refined segments
             const [events, setEvents] = useState([]);
             const [speakers, setSpeakers] = useState([]);
             const [speakerMap] = useState(new Map());
             const [activeSegment, setActiveSegment] = useState(null);
             const [namingSegment, setNamingSegment] = useState(null);
+            const [unknownSpeakers, setUnknownSpeakers] = useState([]); // unknown speaker clusters from TS-VAD
             const [newSpeakerName, setNewSpeakerName] = useState('');
             const [selectedExistingSpeaker, setSelectedExistingSpeaker] = useState(null);
             const [isSaving, setIsSaving] = useState(false);
@@ -901,6 +903,8 @@
                     lastProcessedChunkRef.current = 0;
                     processingRef.current = false;
                     setSegments([]);
+                    setRefinedSegments([]);
+                    setUnknownSpeakers([]);
                     setEvents([]);
                     setSpeakers([]);
                     speakerMap.clear();
@@ -946,8 +950,22 @@
                         const blob = new Blob(audioChunksRef.current, { type: mimeType });
                         setAudioBlob(blob);
                         
-                        // Final diarization with complete audio
-                        await processStreamingDiarization(blob, false);
+                        try {
+                            // Final diarization with complete audio (coarse streaming)
+                            await processStreamingDiarization(blob, false);
+                            
+                            // Run TS-VAD refinement pass
+                            await processRefinedDiarization(blob);
+                        } finally {
+                            if (streamRef.current) {
+                                streamRef.current.getTracks().forEach(track => track.stop());
+                                streamRef.current = null;
+                            }
+                            if (audioContextRef.current) {
+                                audioContextRef.current.close();
+                                audioContextRef.current = null;
+                            }
+                        }
                     };
 
                     // Start recording with timeslice for streaming (1 second chunks)
@@ -1178,6 +1196,70 @@
                 }
             }, [duration, speakers]);
 
+            const processRefinedDiarization = useCallback(async (blob) => {
+                try {
+                    setStatus('processing');
+                    setStatusText('Running TS-VAD refinement...');
+
+                    const formData = new FormData();
+                    formData.append('file', blob, 'recording.webm');
+                    formData.append('response_format', 'diarized_json');
+                    formData.append('stream', 'false');
+                    formData.append('diarization_mode', 'ts_vad');
+                    formData.append('window_size', '2.0');
+                    formData.append('window_hop', '0.5');
+                    formData.append('vad', 'true');
+
+                    const response = await fetch('/v1/audio/transcriptions', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+
+                    const result = await response.json();
+
+                    // Filter segments - exclude silence and low-confidence unknowns
+                    const filteredSegments = (result.segments || []).filter(seg => {
+                        // Exclude silence segments
+                        if (!seg.speaker || seg.speaker === 'silence' || seg.speaker === '') return false;
+                        // Keep known speakers
+                        if (seg.speaker && !seg.speaker.startsWith('unknown_')) return true;
+                        // Keep unknown speakers only if they have reasonable similarity
+                        if (seg.similarity && seg.similarity >= 0.3) return true;
+                        // Keep unknown speakers if no similarity info (assume valid)
+                        if (seg.similarity === undefined || seg.similarity === null) return true;
+                        return false;
+                    });
+
+                    // Update refined segments and unknown speakers
+                    setRefinedSegments(filteredSegments);
+                    setUnknownSpeakers(result.unknown_speakers || []);
+                    setKnownSpeakers(result.known_speakers || []);
+
+                    // Add TS-VAD events to event log
+                    const tsVadEvents = [
+                        { event: 'ts_vad_start', mode: result.mode, duration: result.duration },
+                        ...(result.segments || []).map(seg => ({
+                            event: 'segment',
+                            ...seg
+                        })),
+                        { event: 'ts_vad_done', unknown_count: result.unknown_speakers?.length || 0 }
+                    ];
+                    setEvents(prev => [...prev, ...tsVadEvents]);
+
+                    setStatus('ready');
+                    setStatusText('TS-VAD refinement complete');
+
+                } catch (error) {
+                    console.error('Error processing TS-VAD refinement:', error);
+                    setStatus('ready');
+                    setStatusText('Error in TS-VAD refinement');
+                }
+            }, []);
+
             const togglePlayback = useCallback(() => {
                 if (playbackWavesurferRef.current) {
                     if (playbackWavesurferRef.current.isPlaying()) {
@@ -1361,6 +1443,8 @@
                     
                     // Clear previous state
                     setSegments([]);
+                    setRefinedSegments([]);
+                    setUnknownSpeakers([]);
                     setEvents([]);
                     setSpeakers([]);
                     speakerMap.clear();
@@ -1376,8 +1460,11 @@
                     // Set the audio blob (this will trigger playback waveform creation)
                     setAudioBlob(blob);
                     
-                    // Process diarization
+                    // Process diarization (coarse streaming)
                     await processStreamingDiarization(blob, false);
+                    
+                    // Process TS-VAD refinement
+                    await processRefinedDiarization(blob);
                     
                 } catch (error) {
                     console.error('Error loading recording:', error);
@@ -1386,7 +1473,7 @@
                 } finally {
                     setIsLoadingRecording(false);
                 }
-            }, [isLoadingRecording, isRecording, processStreamingDiarization, speakerMap]);
+            }, [isLoadingRecording, isRecording, processStreamingDiarization, processRefinedDiarization, speakerMap]);
             
             // Delete a saved recording
             const deleteRecording = useCallback(async (recording, e) => {
@@ -1470,12 +1557,23 @@
                     const result = await response.json();
                     console.log('Speaker saved:', result);
                     
-                    // Update the segment with the new speaker name
+                    // Update ALL segments with the same speaker cluster label
+                    const oldSpeakerLabel = namingSegment.speaker;
                     setSegments(prev => prev.map(seg => 
-                        seg.start === namingSegment.start && seg.end === namingSegment.end
+                        seg.speaker === oldSpeakerLabel
                             ? { ...seg, speaker: speakerName }
                             : seg
                     ));
+                    setRefinedSegments(prev => prev.map(seg => 
+                        seg.speaker === oldSpeakerLabel
+                            ? { ...seg, speaker: speakerName }
+                            : seg
+                    ));
+                    
+                    // Remove from unknown speakers if it was an unknown cluster
+                    if (oldSpeakerLabel && oldSpeakerLabel.startsWith('unknown_')) {
+                        setUnknownSpeakers(prev => prev.filter(u => u !== oldSpeakerLabel));
+                    }
                     
                     // Update known speakers list
                     if (!knownSpeakers.includes(speakerName)) {
@@ -1502,7 +1600,10 @@
                 
                 // Clear segments to show fresh results
                 await processStreamingDiarization(audioBlob, false);
-            }, [audioBlob, processStreamingDiarization]);
+                
+                // Also re-run TS-VAD refinement
+                await processRefinedDiarization(audioBlob);
+            }, [audioBlob, processStreamingDiarization, processRefinedDiarization]);
 
             // Compare all segments against a specific speaker
             const compareToSpeaker = useCallback(async (speakerName) => {
@@ -1653,6 +1754,67 @@
                                 </>
                             )}
                         </div>
+                        
+                        {/* Live diarization display during recording */}
+                        {isRecording && segments.length > 0 && (
+                            <div style={{ marginTop: '16px' }}>
+                                <div style={{ 
+                                    display: 'flex', 
+                                    alignItems: 'center', 
+                                    gap: '8px',
+                                    marginBottom: '12px',
+                                    color: '#4a9eff'
+                                }}>
+                                    <span className="live-dot" style={{ width: '8px', height: '8px', background: '#ff416c', borderRadius: '50%', animation: 'pulse 1.5s infinite' }}></span>
+                                    <span style={{ fontWeight: 600 }}>Live Speaker Detection</span>
+                                    <span style={{ color: '#888', fontSize: '13px' }}>({segments.length} segments)</span>
+                                </div>
+                                <div className="diarization-results" style={{ maxHeight: '200px', overflowY: 'auto' }}>
+                                    {segments.slice().reverse().map((seg, i) => {
+                                        const isUnknownSpeaker = seg.speaker && seg.speaker.startsWith('unknown_');
+                                        const displaySpeaker = isUnknownSpeaker 
+                                            ? `Unknown (${seg.speaker})`
+                                            : (seg.speaker || 'Unknown Speaker');
+                                        const similarityPercent = seg.similarity ? Math.round(seg.similarity * 100) : null;
+                                        const similarityColor = seg.similarity >= 0.7 ? '#38ef7d' : seg.similarity >= 0.5 ? '#ffd200' : '#ff6b8a';
+                                        return (
+                                            <div 
+                                                key={i} 
+                                                className="segment"
+                                                style={{ 
+                                                    opacity: i === 0 ? 1 : 0.7,
+                                                    transition: 'opacity 0.3s'
+                                                }}
+                                            >
+                                                <span className="segment-time">
+                                                    {formatTime(seg.start)} → {formatTime(seg.end)}
+                                                </span>
+                                                <span 
+                                                    className={`segment-speaker ${seg.speaker && !isUnknownSpeaker ? 'known' : 'unknown'}`}
+                                                    style={seg.speaker && !isUnknownSpeaker ? { background: getSpeakerColor(seg.speaker, speakerMap) } : {}}
+                                                >
+                                                    {displaySpeaker}
+                                                </span>
+                                                {similarityPercent !== null && (
+                                                    <span 
+                                                        style={{
+                                                            color: similarityColor,
+                                                            fontWeight: 600,
+                                                            fontSize: '12px',
+                                                            marginLeft: '8px',
+                                                            fontFamily: "'Monaco', 'Consolas', monospace"
+                                                        }}
+                                                        title={`Speaker match confidence: ${similarityPercent}%`}
+                                                    >
+                                                        {similarityPercent}%
+                                                    </span>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        )}
                     </div>
 
                     {audioBlob && (
@@ -1876,10 +2038,19 @@
                                         }
                                     }}
                                 >
-                                    {segments.map((seg, i) => {
+                                    {(() => {
+                                        // Show only refined segments if available, otherwise show streaming segments
+                                        const allSegments = (refinedSegments && refinedSegments.length > 0) 
+                                            ? refinedSegments 
+                                            : (segments || []);
+                                        return allSegments.sort((a, b) => a.start - b.start).map((seg, i) => {
                                         const left = (seg.start / duration) * 100;
                                         const width = ((seg.end - seg.start) / duration) * 100;
                                         const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
+                                        const isUnknownSpeaker = seg.speaker && seg.speaker.startsWith('unknown_');
+                                        const displaySpeaker = isUnknownSpeaker 
+                                            ? seg.speaker.replace('unknown_', 'U')
+                                            : (seg.speaker || '?');
                                         return (
                                             <div
                                                 key={i}
@@ -1888,15 +2059,16 @@
                                                 style={{
                                                     left: `${left}%`,
                                                     width: `${width}%`,
-                                                    background: getSpeakerColor(seg.speaker, speakerMap),
+                                                    background: (seg.speaker && !isUnknownSpeaker) ? getSpeakerColor(seg.speaker, speakerMap) : '#666',
                                                     cursor: audioBlob ? 'pointer' : 'default'
                                                 }}
                                                 title={`${seg.speaker || 'Unknown'}: ${formatTime(seg.start)} - ${formatTime(seg.end)}${audioBlob ? ' (click to play)' : ''}`}
                                             >
-                                                {width > 10 ? (seg.speaker || '?') : ''}
+                                                {width > 10 ? displaySpeaker : ''}
                                             </div>
                                         );
-                                    })}
+                                        });
+                                    })()}
                                 </div>
                                 {activeSegment && (
                                     <div className="timeline-info">
@@ -1936,10 +2108,20 @@
                             )}
 
                             <div className="diarization-results">
-                                {segments.map((seg, i) => {
+                                {(() => {
+                                    // Show only refined segments if available, otherwise show streaming segments
+                                    const allSegments = (refinedSegments && refinedSegments.length > 0) 
+                                        ? refinedSegments 
+                                        : (segments || []);
+                                    return allSegments.sort((a, b) => a.start - b.start).map((seg, i) => {
                                     const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
                                     const segKey = `${seg.start}-${seg.end}`;
                                     const similarity = segmentSimilarities[segKey];
+                                    const isUnknownSpeaker = seg.speaker && seg.speaker.startsWith('unknown_');
+                                    const displaySpeaker = isUnknownSpeaker 
+                                        ? `Unknown (${seg.speaker})`
+                                        : (seg.speaker || 'Unknown Speaker');
+                                    
                                     return (
                                     <div 
                                         key={i} 
@@ -1951,6 +2133,22 @@
                                         <span className="segment-time">
                                             {formatTime(seg.start)} → {formatTime(seg.end)}
                                         </span>
+                                        {seg.cause && (
+                                            <span 
+                                                style={{
+                                                    fontSize: '10px',
+                                                    padding: '2px 6px',
+                                                    borderRadius: '4px',
+                                                    background: seg.cause === 'ts_vad' ? 'rgba(56, 239, 125, 0.2)' : 'rgba(74, 158, 255, 0.2)',
+                                                    color: seg.cause === 'ts_vad' ? '#38ef7d' : '#4a9eff',
+                                                    fontWeight: 600,
+                                                    marginLeft: '4px'
+                                                }}
+                                                title={seg.cause === 'ts_vad' ? 'TS-VAD refined segment' : 'Streaming coarse segment'}
+                                            >
+                                                {seg.cause === 'ts_vad' ? '🎯 TS-VAD' : '🌊 Stream'}
+                                            </span>
+                                        )}
                                         {seg.vad_confidence !== undefined && (
                                             <span 
                                                 className={`segment-vad-confidence ${seg.vad_confidence >= 0.8 ? 'high' : seg.vad_confidence >= 0.5 ? 'medium' : 'low'}`}
@@ -1960,11 +2158,28 @@
                                             </span>
                                         )}
                                         <span 
-                                            className={`segment-speaker ${seg.speaker ? 'known' : 'unknown'}`}
-                                            style={seg.speaker ? { background: getSpeakerColor(seg.speaker, speakerMap) } : {}}
+                                            className={`segment-speaker ${seg.speaker && !isUnknownSpeaker ? 'known' : 'unknown'}`}
+                                            style={seg.speaker && !isUnknownSpeaker ? { background: getSpeakerColor(seg.speaker, speakerMap) } : {}}
                                         >
-                                            {seg.speaker || 'Unknown Speaker'}
+                                            {displaySpeaker}
                                         </span>
+                                        {/* Show segment's intrinsic similarity (from backend) when not comparing */}
+                                        {!compareSpeaker && seg.similarity !== undefined && seg.similarity !== null && (
+                                            <span 
+                                                className="segment-similarity"
+                                                style={{
+                                                    color: seg.similarity >= 0.7 ? '#38ef7d' : seg.similarity >= 0.5 ? '#ffd200' : '#ff6b8a',
+                                                    fontWeight: 600,
+                                                    fontSize: '13px',
+                                                    marginLeft: '8px',
+                                                    fontFamily: "'Monaco', 'Consolas', monospace"
+                                                }}
+                                                title={`Speaker match confidence: ${(seg.similarity * 100).toFixed(1)}%`}
+                                            >
+                                                {(seg.similarity * 100).toFixed(0)}%
+                                            </span>
+                                        )}
+                                        {/* Show comparison similarity when comparing to a specific speaker */}
                                         {compareSpeaker && similarity !== undefined && (
                                             <span 
                                                 className="segment-similarity"
@@ -2017,7 +2232,8 @@
                                         )}
                                     </div>
                                     );
-                                })}
+                                    });
+                                })()}
                             </div>
                         </div>
                     )}
