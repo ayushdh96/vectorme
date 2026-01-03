@@ -1227,7 +1227,11 @@
                 } catch (error) {
                     console.error('Error processing TS-VAD refinement:', error);
                     setStatus('ready');
-                    setStatusText('Error in TS-VAD refinement');
+                    setStatusText('TS-VAD refinement failed - showing streaming results');
+                    // Alert user about the failure
+                    alert(`TS-VAD refinement failed: ${error.message}\n\nFalling back to streaming diarization results.`);
+                    // Clear refined segments so coarse segments remain visible
+                    setRefinedSegments([]);
                 }
             }, []);
 
