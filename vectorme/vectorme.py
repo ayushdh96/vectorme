@@ -767,6 +767,28 @@ def _match_cluster_to_known(
     return None, float(res[0]["similarity"]) if res else 0.0
 
 
+from contextlib import contextmanager
+
+@contextmanager
+def _safe_tensor_view(torch_module):
+    """Temporarily patch torch.Tensor.view to fall back to reshape on CPU.
+    
+    NeMo operations may call .view() on tensors with non-contiguous memory layout,
+    which fails on CPU. This context manager scopes the patch to prevent global side effects.
+    """
+    _original_view = torch_module.Tensor.view
+    def _safe_view(self, *args):
+        try:
+            return _original_view(self, *args)
+        except RuntimeError as e:
+            if "view size is not compatible" in str(e):
+                return self.reshape(*args)
+            raise
+    try:
+        torch_module.Tensor.view = _safe_view
+        yield
+    finally:
+        torch_module.Tensor.view = _original_view
 
 
 def nemo_ts_vad_refine(
@@ -798,16 +820,6 @@ def nemo_ts_vad_refine(
     except Exception as e:
         raise ImportError("NeMo diarization (NeuralDiarizer) not available") from e
 
-    # Monkey-patch torch.Tensor.view to use reshape for CPU compatibility
-    # This fixes "view size is not compatible with input tensor's size and stride" errors
-    _original_view = torch.Tensor.view
-    def _safe_view(self, *args):
-        try:
-            return _original_view(self, *args)
-        except RuntimeError:
-            return self.reshape(*args)
-    torch.Tensor.view = _safe_view
-
     work_dir = tempfile.mkdtemp(prefix="nemo_msdd_")
     try:
         # Build NeMo config from local YAML and override runtime paths
@@ -828,7 +840,9 @@ def nemo_ts_vad_refine(
         except Exception:
             pass
 
-        msdd_model.diarize()
+        # Wrap diarization in context manager to safely handle tensor view operations on CPU
+        with _safe_tensor_view(torch):
+            msdd_model.diarize()
 
         # NeMo usually writes RTTM under <out_dir>/pred_rttms/mono_file.rttm or <uniq_id>.rttm.
         # We don't control uniq_id here, so search pred_rttms for the first RTTM.
@@ -855,6 +869,8 @@ def nemo_ts_vad_refine(
         waveform, sr = torchaudio.load(wav_path)
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
+        # Ensure contiguous memory layout for CPU compatibility with NeMo operations
+        waveform = waveform.contiguous()
 
         # Collect raw speakers
         raw_speakers: List[str] = []
@@ -919,8 +935,6 @@ def nemo_ts_vad_refine(
         }
 
     finally:
-        # Restore original torch.Tensor.view
-        torch.Tensor.view = _original_view
         try:
             import shutil
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -1319,9 +1333,6 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
         
         # TS-VAD refinement mode parameters
         diarization_mode = request.form.get("diarization_mode", "coarse")
-        window_size = float(request.form.get("window_size", 2.0))
-        window_hop = float(request.form.get("window_hop", 0.5))
-        unknown_assign_threshold = float(request.form.get("unknown_assign_threshold", 0.75))
         min_segment_duration = float(request.form.get("min_segment_duration", 0.5))
         
         try:
