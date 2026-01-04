@@ -22,6 +22,7 @@ import tempfile
 from pathlib import Path
 import numpy as np
 from typing import Optional, List, Dict, Any, Tuple
+import yaml
 
 # Suppress noisy warnings from dependencies
 os.environ["PYTHONWARNINGS"] = "ignore"
@@ -32,6 +33,23 @@ DEFAULT_DB_PATH = Path.home() / ".vectorme" / "speakers.npz"
 
 # Default recordings directory
 DEFAULT_RECORDINGS_PATH = Path.home() / ".vectorme" / "recordings"
+
+
+def load_config() -> dict:
+    """Load configuration from config.yaml. Raises FileNotFoundError if missing."""
+    config_path = Path(__file__).parent / "config.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Configuration file not found: {config_path}\n"
+            "The config.yaml file is required for VectorMe to run."
+        )
+    
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+# Load configuration at module level
+CONFIG = load_config()
 
 
 class VectorDB:
@@ -710,7 +728,7 @@ def _concat_waveform_for_speaker(
     sample_rate: int,
     segments: List[Dict[str, Any]],
     raw_speaker: str,
-    max_total_seconds: float = 12.0,
+    max_total_seconds: float = None,
 ) -> Tuple[Optional[Any], float]:
     """Concatenate audio for a given RTTM raw speaker id.
 
@@ -718,6 +736,9 @@ def _concat_waveform_for_speaker(
     waveform is a torch Tensor shaped [1, T].
     """
     import torch
+
+    if max_total_seconds is None:
+        max_total_seconds = CONFIG['ts_vad']['max_concat_audio']
 
     pieces = []
     total = 0.0
@@ -799,9 +820,9 @@ def nemo_ts_vad_refine(
     torchaudio,
     torch,
     db: 'VectorDB',
-    identify_threshold: float = 0.5,
-    min_segment_duration: float = 0.3,
-    min_cluster_audio_seconds: float = 1.2,
+    identify_threshold: float = None,
+    min_segment_duration: float = None,
+    min_cluster_audio_seconds: float = None,
     device: str = "cpu",
 ) -> Dict[str, Any]:
     """Run NeMo MSDD diarization (TS-VAD-style refinement) and then map diarized speakers to known names.
@@ -813,6 +834,14 @@ def nemo_ts_vad_refine(
 
     Returns API schema compatible with the frontend: {mode, duration, segments, unknown_speakers, known_speakers, backend}
     """
+    # Load default values from config
+    if identify_threshold is None:
+        identify_threshold = CONFIG['ts_vad']['identify_threshold']
+    if min_segment_duration is None:
+        min_segment_duration = CONFIG['ts_vad']['min_segment_duration']
+    if min_cluster_audio_seconds is None:
+        min_cluster_audio_seconds = CONFIG['ts_vad']['min_cluster_audio']
+    
     from omegaconf import OmegaConf
 
     try:
