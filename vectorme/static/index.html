@@ -727,11 +727,6 @@
             const [isSaving, setIsSaving] = useState(false);
             const [knownSpeakers, setKnownSpeakers] = useState([]);
             
-            // Diarization mode state
-            const [diarizationMode, setDiarizationMode] = useState('fast'); // 'fast' or 'accurate'
-            const [refinedSegments, setRefinedSegments] = useState([]); // TS-VAD refined segments
-            const [unknownSpeakers, setUnknownSpeakers] = useState([]); // unknown speaker clusters from TS-VAD
-            
             // Saved recordings state
             const [savedRecordings, setSavedRecordings] = useState([]);
             const [recordingName, setRecordingName] = useState('');
@@ -746,6 +741,13 @@
             const [segmentSimilarities, setSegmentSimilarities] = useState({}); // {"start-end": similarity}
             const [identifyingSegment, setIdentifyingSegment] = useState(null); // segment being identified
             const [segmentIdentifications, setSegmentIdentifications] = useState({}); // {"start-end": {matches, top_match}}
+            
+            // Diarization mode state
+            const [diarizationMode, setDiarizationMode] = useState(() => {
+                return localStorage.getItem('diarizationMode') || 'fast';
+            });
+            const [refinedSegments, setRefinedSegments] = useState([]);
+            const [unknownSpeakers, setUnknownSpeakers] = useState([]);
 
             const waveformRef = useRef(null);
             const playbackWaveformRef = useRef(null);
@@ -763,6 +765,25 @@
             const audioContextRef = useRef(null);
             const analyserRef = useRef(null);
             const animationRef = useRef(null);
+
+            const handleModeChange = (e) => {
+                const newMode = e.target.value;
+                localStorage.setItem('diarizationMode', newMode);
+                setDiarizationMode(newMode);
+                
+                // Clear refined segments if switching to fast mode
+                if (newMode === 'fast') {
+                    setRefinedSegments([]);
+                    setUnknownSpeakers([]);
+                }
+            };
+
+            // Memoize displaySegments to prevent unnecessary re-renders
+            const displaySegments = React.useMemo(() => {
+                return (diarizationMode === 'accurate' && refinedSegments.length > 0)
+                    ? refinedSegments
+                    : segments;
+            }, [diarizationMode, refinedSegments, segments]);
 
             // Initialize recording waveform
             useEffect(() => {
@@ -906,10 +927,10 @@
                     lastProcessedChunkRef.current = 0;
                     processingRef.current = false;
                     setSegments([]);
-                    setRefinedSegments([]);
-                    setUnknownSpeakers([]);
                     setEvents([]);
                     setSpeakers([]);
+                    setRefinedSegments([]);
+                    setUnknownSpeakers([]);
                     speakerMap.clear();
                     setActiveSegment(null);
                     activeSegmentRef.current = null;
@@ -956,7 +977,7 @@
                         // Final diarization with complete audio
                         await processStreamingDiarization(blob, false);
                         
-                        // Run TS-VAD refinement if accurate mode is selected
+                        // Run TS-VAD if accurate mode
                         if (diarizationMode === 'accurate') {
                             await processRefinedDiarization(blob);
                         }
@@ -1207,30 +1228,22 @@
                     });
 
                     if (!response.ok) {
-                        throw new Error(`HTTP error! status: ${response.status}`);
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                     }
 
                     const result = await response.json();
 
-                    // Update refined segments and unknown speakers
                     setRefinedSegments(result.segments || []);
                     setUnknownSpeakers(result.unknown_speakers || []);
-                    setKnownSpeakers(prev => {
-                        const newKnown = result.known_speakers || [];
-                        const merged = [...new Set([...prev, ...newKnown])];
-                        return merged;
-                    });
-
+                    setKnownSpeakers(prev => [...new Set([...prev, ...(result.known_speakers || [])])]);
+                    
                     setStatus('ready');
                     setStatusText('TS-VAD refinement complete');
-
                 } catch (error) {
                     console.error('Error processing TS-VAD refinement:', error);
                     setStatus('ready');
                     setStatusText('TS-VAD refinement failed - showing streaming results');
-                    // Alert user about the failure
-                    alert(`TS-VAD refinement failed: ${error.message}\n\nFalling back to streaming diarization results.`);
-                    // Clear refined segments so coarse segments remain visible
+                    alert(`TS-VAD refinement failed: ${error.message}`);
                     setRefinedSegments([]);
                 }
             }, []);
@@ -1418,10 +1431,10 @@
                     
                     // Clear previous state
                     setSegments([]);
-                    setRefinedSegments([]);
-                    setUnknownSpeakers([]);
                     setEvents([]);
                     setSpeakers([]);
+                    setRefinedSegments([]);
+                    setUnknownSpeakers([]);
                     speakerMap.clear();
                     setActiveSegment(null);
                     activeSegmentRef.current = null;
@@ -1438,7 +1451,7 @@
                     // Process diarization
                     await processStreamingDiarization(blob, false);
                     
-                    // Run TS-VAD refinement if accurate mode is selected
+                    // Run TS-VAD if accurate mode
                     if (diarizationMode === 'accurate') {
                         await processRefinedDiarization(blob);
                     }
@@ -1537,16 +1550,12 @@
                     // Update ALL segments with the same speaker cluster label
                     const oldSpeakerLabel = namingSegment.speaker;
                     setSegments(prev => prev.map(seg => 
-                        seg.speaker === oldSpeakerLabel
-                            ? { ...seg, speaker: speakerName }
-                            : seg
+                        seg.speaker === oldSpeakerLabel ? { ...seg, speaker: speakerName } : seg
                     ));
-                    setRefinedSegments(prev => prev.map(seg => 
-                        seg.speaker === oldSpeakerLabel
-                            ? { ...seg, speaker: speakerName }
-                            : seg
+                    setRefinedSegments(prev => prev.map(seg =>
+                        seg.speaker === oldSpeakerLabel ? { ...seg, speaker: speakerName } : seg
                     ));
-                    
+
                     // Remove from unknown speakers if it was an unknown cluster
                     if (oldSpeakerLabel && oldSpeakerLabel.startsWith('unknown_')) {
                         setUnknownSpeakers(prev => prev.filter(u => u !== oldSpeakerLabel));
@@ -1578,7 +1587,7 @@
                 // Clear segments to show fresh results
                 await processStreamingDiarization(audioBlob, false);
                 
-                // Run TS-VAD refinement if accurate mode is selected
+                // Run TS-VAD if accurate mode
                 if (diarizationMode === 'accurate') {
                     await processRefinedDiarization(audioBlob);
                 }
@@ -1654,14 +1663,14 @@
                         [segKey]: result
                     }));
                     
-                    // If we got a top match, update the segment's speaker in both arrays
+                    // If we got a top match, update the segment's speaker
                     if (result.top_match && result.top_match.similarity >= 0.5) {
                         setSegments(prev => prev.map(s => 
                             s.start === seg.start && s.end === seg.end
                                 ? { ...s, speaker: result.top_match.name }
                                 : s
                         ));
-                        setRefinedSegments(prev => prev.map(s => 
+                        setRefinedSegments(prev => prev.map(s =>
                             s.start === seg.start && s.end === seg.end
                                 ? { ...s, speaker: result.top_match.name }
                                 : s
@@ -1712,10 +1721,9 @@
                         </div>
 
                         <div className="controls">
-                            {/* Diarization Mode Selector */}
                             <select
                                 value={diarizationMode}
-                                onChange={(e) => setDiarizationMode(e.target.value)}
+                                onChange={handleModeChange}
                                 disabled={isRecording}
                                 style={{
                                     padding: '8px 12px',
@@ -1980,32 +1988,27 @@
                                         }
                                     }}
                                 >
-                                    {(() => {
-                                        const displaySegments = (diarizationMode === 'accurate' && refinedSegments.length > 0)
-                                            ? refinedSegments
-                                            : segments;
-                                        return displaySegments.map((seg, i) => {
-                                            const left = (seg.start / duration) * 100;
-                                            const width = ((seg.end - seg.start) / duration) * 100;
-                                            const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
-                                            return (
-                                                <div
-                                                    key={i}
-                                                    className={`timeline-segment ${isActive ? 'active' : ''}`}
-                                                    onClick={() => seekToSegment(seg)}
-                                                    style={{
-                                                        left: `${left}%`,
-                                                        width: `${width}%`,
-                                                        background: getSpeakerColor(seg.speaker, speakerMap),
-                                                        cursor: audioBlob ? 'pointer' : 'default'
-                                                    }}
-                                                    title={`${seg.speaker || 'Unknown'}: ${formatTime(seg.start)} - ${formatTime(seg.end)}${audioBlob ? ' (click to play)' : ''}`}
-                                                >
-                                                    {width > 10 ? (seg.speaker || '?') : ''}
-                                                </div>
-                                            );
-                                        });
-                                    })()}
+                                    {displaySegments.map((seg, i) => {
+                                        const left = (seg.start / duration) * 100;
+                                        const width = ((seg.end - seg.start) / duration) * 100;
+                                        const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
+                                        return (
+                                            <div
+                                                key={`${seg.start}-${seg.end}-${seg.speaker || 'unknown'}`}
+                                                className={`timeline-segment ${isActive ? 'active' : ''}`}
+                                                onClick={() => seekToSegment(seg)}
+                                                style={{
+                                                    left: `${left}%`,
+                                                    width: `${width}%`,
+                                                    background: getSpeakerColor(seg.speaker, speakerMap),
+                                                    cursor: audioBlob ? 'pointer' : 'default'
+                                                }}
+                                                title={`${seg.speaker || 'Unknown'}: ${formatTime(seg.start)} - ${formatTime(seg.end)}${audioBlob ? ' (click to play)' : ''}`}
+                                            >
+                                                {width > 10 ? (seg.speaker || '?') : ''}
+                                            </div>
+                                        );
+                                    })}
                                 </div>
                                 {activeSegment && (
                                     <div className="timeline-info">
@@ -2045,93 +2048,88 @@
                             )}
 
                             <div className="diarization-results">
-                                {(() => {
-                                    const displaySegments = (diarizationMode === 'accurate' && refinedSegments.length > 0)
-                                        ? refinedSegments
-                                        : segments;
-                                    return displaySegments.map((seg, i) => {
-                                        const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
-                                        const segKey = `${seg.start}-${seg.end}`;
-                                        const similarity = segmentSimilarities[segKey];
-                                        return (
-                                        <div 
-                                            key={i} 
-                                            className={`segment ${isActive ? 'active' : ''}`}
-                                            onClick={() => seekToSegment(seg)}
-                                            style={{ cursor: audioBlob ? 'pointer' : 'default' }}
-                                            title={audioBlob ? 'Click to play from this segment' : 'Record audio to enable playback'}
-                                        >
-                                            <span className="segment-time">
-                                                {formatTime(seg.start)} → {formatTime(seg.end)}
-                                            </span>
-                                            {seg.vad_confidence !== undefined && (
-                                                <span 
-                                                    className={`segment-vad-confidence ${seg.vad_confidence >= 0.8 ? 'high' : seg.vad_confidence >= 0.5 ? 'medium' : 'low'}`}
-                                                    title={`VAD confidence: ${(seg.vad_confidence * 100).toFixed(1)}%`}
-                                                >
-                                                    🎤 {(seg.vad_confidence * 100).toFixed(0)}%
-                                                </span>
-                                            )}
+                                {displaySegments.map((seg, i) => {
+                                    const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
+                                    const segKey = `${seg.start}-${seg.end}`;
+                                    const similarity = segmentSimilarities[segKey];
+                                    return (
+                                    <div 
+                                        key={`${seg.start}-${seg.end}-${seg.speaker || 'unknown'}`}
+                                        className={`segment ${isActive ? 'active' : ''}`}
+                                        onClick={() => seekToSegment(seg)}
+                                        style={{ cursor: audioBlob ? 'pointer' : 'default' }}
+                                        title={audioBlob ? 'Click to play from this segment' : 'Record audio to enable playback'}
+                                    >
+                                        <span className="segment-time">
+                                            {formatTime(seg.start)} → {formatTime(seg.end)}
+                                        </span>
+                                        {seg.vad_confidence !== undefined && (
                                             <span 
-                                                className={`segment-speaker ${seg.speaker ? 'known' : 'unknown'}`}
-                                                style={seg.speaker ? { background: getSpeakerColor(seg.speaker, speakerMap) } : {}}
+                                                className={`segment-vad-confidence ${seg.vad_confidence >= 0.8 ? 'high' : seg.vad_confidence >= 0.5 ? 'medium' : 'low'}`}
+                                                title={`VAD confidence: ${(seg.vad_confidence * 100).toFixed(1)}%`}
                                             >
-                                                {seg.speaker || 'Unknown Speaker'}
+                                                🎤 {(seg.vad_confidence * 100).toFixed(0)}%
                                             </span>
-                                            {compareSpeaker && similarity !== undefined && (
-                                                <span 
-                                                    className="segment-similarity"
-                                                    style={{
-                                                        color: similarity >= 0.7 ? '#38ef7d' : similarity >= 0.5 ? '#ffd200' : '#ff6b8a',
-                                                        fontWeight: 600,
-                                                        fontSize: '13px',
-                                                        marginLeft: '8px',
-                                                        fontFamily: "'Monaco', 'Consolas', monospace"
-                                                    }}
-                                                    title={`Similarity to ${compareSpeaker}: ${(similarity * 100).toFixed(1)}%`}
-                                                >
-                                                    {similarity !== null ? `${(similarity * 100).toFixed(0)}%` : '—'}
-                                                </span>
-                                            )}
-                                            {audioBlob && <span className="segment-play-icon">{isActive ? '⏸' : '▶'}</span>}
-                                            {audioBlob && (
-                                                <button 
-                                                    className="segment-name-btn"
-                                                    onClick={(e) => identifySegment(seg, e)}
-                                                    disabled={identifyingSegment === segKey}
-                                                    title="Identify speaker for this segment"
-                                                    style={{ marginLeft: '4px' }}
-                                                >
-                                                    {identifyingSegment === segKey ? '⏳' : '🔍'} ID
-                                                </button>
-                                            )}
-                                            {audioBlob && (
-                                                <button 
-                                                    className="segment-name-btn"
-                                                    onClick={(e) => openNamingModal(seg, e)}
-                                                    title="Name this speaker"
-                                                >
-                                                    ✏️ Name
-                                                </button>
-                                            )}
-                                            {segmentIdentifications[segKey]?.top_match && (
-                                                <span 
-                                                    style={{
-                                                        fontSize: '11px',
-                                                        color: segmentIdentifications[segKey].top_match.similarity >= 0.7 ? '#38ef7d' : 
-                                                               segmentIdentifications[segKey].top_match.similarity >= 0.5 ? '#ffd200' : '#ff6b8a',
-                                                        marginLeft: '8px',
-                                                        fontFamily: "'Monaco', 'Consolas', monospace"
-                                                    }}
-                                                    title={`Top matches: ${segmentIdentifications[segKey].matches.map(m => `${m.name}: ${(m.similarity * 100).toFixed(0)}%`).join(', ')}`}
-                                                >
-                                                    → {segmentIdentifications[segKey].top_match.name} ({(segmentIdentifications[segKey].top_match.similarity * 100).toFixed(0)}%)
-                                                </span>
-                                            )}
-                                        </div>
-                                        );
-                                    });
-                                })()}
+                                        )}
+                                        <span 
+                                            className={`segment-speaker ${seg.speaker ? 'known' : 'unknown'}`}
+                                            style={seg.speaker ? { background: getSpeakerColor(seg.speaker, speakerMap) } : {}}
+                                        >
+                                            {seg.speaker || 'Unknown Speaker'}
+                                        </span>
+                                        {compareSpeaker && similarity !== undefined && (
+                                            <span 
+                                                className="segment-similarity"
+                                                style={{
+                                                    color: similarity >= 0.7 ? '#38ef7d' : similarity >= 0.5 ? '#ffd200' : '#ff6b8a',
+                                                    fontWeight: 600,
+                                                    fontSize: '13px',
+                                                    marginLeft: '8px',
+                                                    fontFamily: "'Monaco', 'Consolas', monospace"
+                                                }}
+                                                title={`Similarity to ${compareSpeaker}: ${(similarity * 100).toFixed(1)}%`}
+                                            >
+                                                {similarity !== null ? `${(similarity * 100).toFixed(0)}%` : '—'}
+                                            </span>
+                                        )}
+                                        {audioBlob && <span className="segment-play-icon">{isActive ? '⏸' : '▶'}</span>}
+                                        {audioBlob && (
+                                            <button 
+                                                className="segment-name-btn"
+                                                onClick={(e) => identifySegment(seg, e)}
+                                                disabled={identifyingSegment === segKey}
+                                                title="Identify speaker for this segment"
+                                                style={{ marginLeft: '4px' }}
+                                            >
+                                                {identifyingSegment === segKey ? '⏳' : '🔍'} ID
+                                            </button>
+                                        )}
+                                        {audioBlob && (
+                                            <button 
+                                                className="segment-name-btn"
+                                                onClick={(e) => openNamingModal(seg, e)}
+                                                title="Name this speaker"
+                                            >
+                                                ✏️ Name
+                                            </button>
+                                        )}
+                                        {segmentIdentifications[segKey]?.top_match && (
+                                            <span 
+                                                style={{
+                                                    fontSize: '11px',
+                                                    color: segmentIdentifications[segKey].top_match.similarity >= 0.7 ? '#38ef7d' : 
+                                                           segmentIdentifications[segKey].top_match.similarity >= 0.5 ? '#ffd200' : '#ff6b8a',
+                                                    marginLeft: '8px',
+                                                    fontFamily: "'Monaco', 'Consolas', monospace"
+                                                }}
+                                                title={`Top matches: ${segmentIdentifications[segKey].matches.map(m => `${m.name}: ${(m.similarity * 100).toFixed(0)}%`).join(', ')}`}
+                                            >
+                                                → {segmentIdentifications[segKey].top_match.name} ({(segmentIdentifications[segKey].top_match.similarity * 100).toFixed(0)}%)
+                                            </span>
+                                        )}
+                                    </div>
+                                    );
+                                })}
                             </div>
                         </div>
                     )}

@@ -901,6 +901,30 @@ def nemo_ts_vad_refine(
         # Ensure contiguous memory layout for CPU compatibility with NeMo operations
         waveform = waveform.contiguous()
 
+        # VAD hard gate: filter out silence/noise segments
+        vad = SileroVAD(torch, threshold=CONFIG['vad']['confidence_threshold'])
+        vad_filtered: List[Dict[str, Any]] = []
+        for s in filtered:
+            start_sample = int(float(s['start']) * sr)
+            end_sample = int(float(s['end']) * sr)
+            segment_wave = waveform[:, start_sample:end_sample]
+            
+            if segment_wave.shape[1] == 0:
+                continue  # Skip empty segments
+            
+            has_speech, avg_confidence, speech_ratio = vad.get_speech_confidence(segment_wave, sr)
+            
+            # Drop segment if speech_ratio < 0.15 OR avg_confidence < 0.25
+            if speech_ratio < 0.15 or avg_confidence < 0.25:
+                continue  # Drop this segment (silence/noise)
+            
+            # Keep segment with VAD metrics
+            s['vad_confidence'] = round(float(avg_confidence), 3)
+            s['vad_speech_ratio'] = round(float(speech_ratio), 3)
+            vad_filtered.append(s)
+        
+        filtered = vad_filtered
+
         # Collect raw speakers
         raw_speakers: List[str] = []
         for s in filtered:
@@ -934,14 +958,66 @@ def nemo_ts_vad_refine(
                 unknown_idx += 1
                 speaker_map[rs] = {"label": f"unknown_{unknown_idx}", "similarity": float(sim)}
 
+        # Apply speaker labels to segments for merging
+        labeled_segments: List[Dict[str, Any]] = []
+        for s in filtered:
+            rs = s.get("raw_speaker")
+            mapped = speaker_map.get(rs, {"label": None, "similarity": 0.0})
+            s_copy = s.copy()
+            s_copy["final_speaker"] = mapped.get("label")
+            s_copy["similarity"] = mapped.get("similarity", 0.0)
+            labeled_segments.append(s_copy)
+        
+        # Sort by start time
+        labeled_segments.sort(key=lambda x: float(x["start"]))
+        
+        # Merge segments with same speaker if gap < 0.5s
+        # Remove short unknown segments (<0.6s) sandwiched between same speakers
+        merged: List[Dict[str, Any]] = []
+        for s in labeled_segments:
+            if not merged:
+                merged.append(s)
+                continue
+            
+            prev = merged[-1]
+            gap = float(s["start"]) - float(prev["end"])
+            
+            # Merge if same speaker and gap < 0.5s
+            if prev["final_speaker"] == s["final_speaker"] and gap < 0.5:
+                prev["end"] = s["end"]
+                # Keep higher similarity
+                prev["similarity"] = max(float(prev.get("similarity", 0.0)), float(s.get("similarity", 0.0)))
+                continue
+            
+            # Check if previous segment is short unknown sandwiched between same speakers
+            if (
+                len(merged) >= 2 and
+                prev["final_speaker"] and
+                prev["final_speaker"].startswith("unknown_") and
+                (float(prev["end"]) - float(prev["start"])) < 0.6
+            ):
+                # Look ahead to see if current segment has same speaker as segment before prev
+                before_prev = merged[-2]
+                if before_prev["final_speaker"] == s["final_speaker"]:
+                    # Remove the short unknown segment and merge surrounding segments
+                    merged.pop()  # Remove prev (short unknown)
+                    before_prev["end"] = s["end"]
+                    before_prev["similarity"] = max(
+                        float(before_prev.get("similarity", 0.0)),
+                        float(s.get("similarity", 0.0))
+                    )
+                    continue
+            
+            merged.append(s)
+        
+        filtered = merged
+
         # Apply mapping to segments
         out_segments: List[Dict[str, Any]] = []
         unknown_speakers: List[str] = []
         for s in filtered:
-            rs = s.get("raw_speaker")
-            mapped = speaker_map.get(rs, {"label": None, "similarity": 0.0})
-            label = mapped.get("label")
-            sim = mapped.get("similarity", 0.0)
+            label = s.get("final_speaker")
+            sim = s.get("similarity", 0.0)
             if isinstance(label, str) and label.startswith("unknown_") and label not in unknown_speakers:
                 unknown_speakers.append(label)
 
