@@ -695,7 +695,7 @@
         ];
 
         function getSpeakerColor(speaker, speakerMap) {
-            if (!speaker) return 'rgba(128, 128, 128, 0.5)';
+            if (!speaker || speaker.startsWith('unknown_')) return 'rgba(128, 128, 128, 0.5)';
             if (!speakerMap.has(speaker)) {
                 speakerMap.set(speaker, SPEAKER_COLORS[speakerMap.size % SPEAKER_COLORS.length]);
             }
@@ -741,6 +741,13 @@
             const [segmentSimilarities, setSegmentSimilarities] = useState({}); // {"start-end": similarity}
             const [identifyingSegment, setIdentifyingSegment] = useState(null); // segment being identified
             const [segmentIdentifications, setSegmentIdentifications] = useState({}); // {"start-end": {matches, top_match}}
+            
+            // Diarization mode state
+            const [diarizationMode, setDiarizationMode] = useState(() => {
+                return localStorage.getItem('diarizationMode') || 'fast';
+            });
+            const [refinedSegments, setRefinedSegments] = useState([]);
+            const [unknownSpeakers, setUnknownSpeakers] = useState([]);
 
             const waveformRef = useRef(null);
             const playbackWaveformRef = useRef(null);
@@ -758,6 +765,25 @@
             const audioContextRef = useRef(null);
             const analyserRef = useRef(null);
             const animationRef = useRef(null);
+
+            const handleModeChange = (e) => {
+                const newMode = e.target.value;
+                localStorage.setItem('diarizationMode', newMode);
+                setDiarizationMode(newMode);
+                
+                // Clear refined segments if switching to fast mode
+                if (newMode === 'fast') {
+                    setRefinedSegments([]);
+                    setUnknownSpeakers([]);
+                }
+            };
+
+            // Memoize displaySegments to prevent unnecessary re-renders
+            const displaySegments = React.useMemo(() => {
+                return (diarizationMode === 'accurate' && refinedSegments.length > 0)
+                    ? refinedSegments
+                    : segments;
+            }, [diarizationMode, refinedSegments, segments]);
 
             // Initialize recording waveform
             useEffect(() => {
@@ -903,6 +929,8 @@
                     setSegments([]);
                     setEvents([]);
                     setSpeakers([]);
+                    setRefinedSegments([]);
+                    setUnknownSpeakers([]);
                     speakerMap.clear();
                     setActiveSegment(null);
                     activeSegmentRef.current = null;
@@ -948,6 +976,11 @@
                         
                         // Final diarization with complete audio
                         await processStreamingDiarization(blob, false);
+                        
+                        // Run TS-VAD if accurate mode
+                        if (diarizationMode === 'accurate') {
+                            await processRefinedDiarization(blob);
+                        }
                     };
 
                     // Start recording with timeslice for streaming (1 second chunks)
@@ -1034,7 +1067,7 @@
                     setStatus('ready');
                     setStatusText('Error: Could not access microphone');
                 }
-            }, [speakerMap, processStreamingDiarization]);
+            }, [speakerMap, processStreamingDiarization, processRefinedDiarization, diarizationMode]);
 
             const stopRecording = useCallback(() => {
                 if (mediaRecorderRef.current && (mediaRecorderRef.current.state === 'recording' || mediaRecorderRef.current.state === 'paused')) {
@@ -1177,6 +1210,43 @@
                     processingRef.current = false;
                 }
             }, [duration, speakers]);
+
+            const processRefinedDiarization = useCallback(async (blob) => {
+                try {
+                    setStatus('processing');
+                    setStatusText('Running TS-VAD refinement...');
+
+                    const formData = new FormData();
+                    formData.append('file', blob, 'recording.webm');
+                    formData.append('response_format', 'diarized_json');
+                    formData.append('stream', 'false');
+                    formData.append('diarization_mode', 'ts_vad');
+
+                    const response = await fetch('/v1/audio/transcriptions', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+
+                    const result = await response.json();
+
+                    setRefinedSegments(result.segments || []);
+                    setUnknownSpeakers(result.unknown_speakers || []);
+                    setKnownSpeakers(prev => [...new Set([...prev, ...(result.known_speakers || [])])]);
+                    
+                    setStatus('ready');
+                    setStatusText('TS-VAD refinement complete');
+                } catch (error) {
+                    console.error('Error processing TS-VAD refinement:', error);
+                    setStatus('ready');
+                    setStatusText('TS-VAD refinement failed - showing streaming results');
+                    alert(`TS-VAD refinement failed: ${error.message}`);
+                    setRefinedSegments([]);
+                }
+            }, []);
 
             const togglePlayback = useCallback(() => {
                 if (playbackWavesurferRef.current) {
@@ -1363,6 +1433,8 @@
                     setSegments([]);
                     setEvents([]);
                     setSpeakers([]);
+                    setRefinedSegments([]);
+                    setUnknownSpeakers([]);
                     speakerMap.clear();
                     setActiveSegment(null);
                     activeSegmentRef.current = null;
@@ -1379,6 +1451,11 @@
                     // Process diarization
                     await processStreamingDiarization(blob, false);
                     
+                    // Run TS-VAD if accurate mode
+                    if (diarizationMode === 'accurate') {
+                        await processRefinedDiarization(blob);
+                    }
+                    
                 } catch (error) {
                     console.error('Error loading recording:', error);
                     setStatus('ready');
@@ -1386,7 +1463,7 @@
                 } finally {
                     setIsLoadingRecording(false);
                 }
-            }, [isLoadingRecording, isRecording, processStreamingDiarization, speakerMap]);
+            }, [isLoadingRecording, isRecording, processStreamingDiarization, processRefinedDiarization, diarizationMode, speakerMap]);
             
             // Delete a saved recording
             const deleteRecording = useCallback(async (recording, e) => {
@@ -1470,12 +1547,19 @@
                     const result = await response.json();
                     console.log('Speaker saved:', result);
                     
-                    // Update the segment with the new speaker name
+                    // Update ALL segments with the same speaker cluster label
+                    const oldSpeakerLabel = namingSegment.speaker;
                     setSegments(prev => prev.map(seg => 
-                        seg.start === namingSegment.start && seg.end === namingSegment.end
-                            ? { ...seg, speaker: speakerName }
-                            : seg
+                        seg.speaker === oldSpeakerLabel ? { ...seg, speaker: speakerName } : seg
                     ));
+                    setRefinedSegments(prev => prev.map(seg =>
+                        seg.speaker === oldSpeakerLabel ? { ...seg, speaker: speakerName } : seg
+                    ));
+
+                    // Remove from unknown speakers if it was an unknown cluster
+                    if (oldSpeakerLabel && oldSpeakerLabel.startsWith('unknown_')) {
+                        setUnknownSpeakers(prev => prev.filter(u => u !== oldSpeakerLabel));
+                    }
                     
                     // Update known speakers list
                     if (!knownSpeakers.includes(speakerName)) {
@@ -1502,7 +1586,12 @@
                 
                 // Clear segments to show fresh results
                 await processStreamingDiarization(audioBlob, false);
-            }, [audioBlob, processStreamingDiarization]);
+                
+                // Run TS-VAD if accurate mode
+                if (diarizationMode === 'accurate') {
+                    await processRefinedDiarization(audioBlob);
+                }
+            }, [audioBlob, processStreamingDiarization, processRefinedDiarization, diarizationMode]);
 
             // Compare all segments against a specific speaker
             const compareToSpeaker = useCallback(async (speakerName) => {
@@ -1581,6 +1670,11 @@
                                 ? { ...s, speaker: result.top_match.name }
                                 : s
                         ));
+                        setRefinedSegments(prev => prev.map(s =>
+                            s.start === seg.start && s.end === seg.end
+                                ? { ...s, speaker: result.top_match.name }
+                                : s
+                        ));
                         // Update speaker color
                         getSpeakerColor(result.top_match.name, speakerMap);
                     }
@@ -1627,6 +1721,24 @@
                         </div>
 
                         <div className="controls">
+                            <select
+                                value={diarizationMode}
+                                onChange={handleModeChange}
+                                disabled={isRecording}
+                                style={{
+                                    padding: '8px 12px',
+                                    fontSize: '14px',
+                                    background: 'rgba(255,255,255,0.1)',
+                                    color: '#fff',
+                                    border: '1px solid rgba(255,255,255,0.2)',
+                                    borderRadius: '6px',
+                                    marginRight: '12px',
+                                    cursor: isRecording ? 'not-allowed' : 'pointer'
+                                }}
+                            >
+                                <option value="fast" style={{ background: '#1a1a2e' }}>⚡ Fast</option>
+                                <option value="accurate" style={{ background: '#1a1a2e' }}>🎯 Accurate</option>
+                            </select>
                             {!isRecording ? (
                                 <button 
                                     className="btn-record" 
@@ -1876,13 +1988,13 @@
                                         }
                                     }}
                                 >
-                                    {segments.map((seg, i) => {
+                                    {displaySegments.map((seg, i) => {
                                         const left = (seg.start / duration) * 100;
                                         const width = ((seg.end - seg.start) / duration) * 100;
                                         const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
                                         return (
                                             <div
-                                                key={i}
+                                                key={`${seg.start}-${seg.end}-${seg.speaker || 'unknown'}`}
                                                 className={`timeline-segment ${isActive ? 'active' : ''}`}
                                                 onClick={() => seekToSegment(seg)}
                                                 style={{
@@ -1936,13 +2048,13 @@
                             )}
 
                             <div className="diarization-results">
-                                {segments.map((seg, i) => {
+                                {displaySegments.map((seg, i) => {
                                     const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
                                     const segKey = `${seg.start}-${seg.end}`;
                                     const similarity = segmentSimilarities[segKey];
                                     return (
                                     <div 
-                                        key={i} 
+                                        key={`${seg.start}-${seg.end}-${seg.speaker || 'unknown'}`}
                                         className={`segment ${isActive ? 'active' : ''}`}
                                         onClick={() => seekToSegment(seg)}
                                         style={{ cursor: audioBlob ? 'pointer' : 'default' }}
