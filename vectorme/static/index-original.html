@@ -4,17 +4,683 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VectorMe - Voice Recording & Speaker Diarization</title>
-    
-    <!-- External Dependencies -->
     <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <script src="https://unpkg.com/wavesurfer.js@7"></script>
     <script src="https://unpkg.com/wavesurfer.js@7/dist/plugins/regions.min.js"></script>
     <script src="https://unpkg.com/wavesurfer.js@7/dist/plugins/record.esm.js" type="module"></script>
-    
-    <!-- Application Styles -->
-    <link rel="stylesheet" href="/static/styles.css">
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .waveform-container {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 12px;
+            padding: 12px;
+            margin-bottom: 16px;
+            min-height: 70px;
+        }
+        .controls {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .btn-record {
+            background: linear-gradient(135deg, #ff416c, #ff4b2b);
+            color: white;
+        }
+        .btn-record:hover:not(:disabled) {
+            transform: scale(1.05);
+            box-shadow: 0 4px 20px rgba(255, 65, 108, 0.4);
+        }
+        .btn-record.recording {
+            animation: pulse 1.5s infinite;
+        }
+        .btn-stop {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+        }
+        .btn-stop:hover:not(:disabled) {
+            transform: scale(1.05);
+            box-shadow: 0 4px 20px rgba(102, 126, 234, 0.4);
+        }
+        .btn-play {
+            background: linear-gradient(135deg, #11998e, #38ef7d);
+            color: white;
+        }
+        .btn-play:hover:not(:disabled) {
+            transform: scale(1.05);
+            box-shadow: 0 4px 20px rgba(56, 239, 125, 0.4);
+        }
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(255, 65, 108, 0.7); }
+            50% { box-shadow: 0 0 0 15px rgba(255, 65, 108, 0); }
+        }
+        .status {
+            text-align: center;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-weight: 500;
+        }
+        .status.recording {
+            background: rgba(255, 65, 108, 0.2);
+            color: #ff6b8a;
+        }
+        .status.processing {
+            background: rgba(102, 126, 234, 0.2);
+            color: #a0b0ff;
+        }
+        .status.ready {
+            background: rgba(56, 239, 125, 0.2);
+            color: #6bffb3;
+        }
+        .diarization-results {
+            margin-top: 20px;
+        }
+        .diarization-results h3 {
+            margin-bottom: 16px;
+            color: #a0b0ff;
+        }
+        .segment {
+            display: flex;
+            align-items: center;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            margin-bottom: 8px;
+            transition: all 0.2s ease;
+        }
+        .segment:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+        .segment-time {
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 14px;
+            color: #888;
+            min-width: 120px;
+        }
+        .segment-speaker {
+            flex: 1;
+            font-weight: 600;
+            padding: 4px 12px;
+            border-radius: 4px;
+            display: inline-block;
+        }
+        .segment-speaker.unknown {
+            background: rgba(255, 255, 255, 0.1);
+            color: #999;
+        }
+        .segment-speaker.known {
+            background: linear-gradient(135deg, #00d2ff, #3a7bd5);
+            color: white;
+            box-shadow: 0 0 8px rgba(0, 210, 255, 0.5), 0 0 16px rgba(58, 123, 213, 0.3);
+            animation: speakerGlow 2s ease-in-out infinite alternate;
+        }
+        @keyframes speakerGlow {
+            from { box-shadow: 0 0 8px rgba(0, 210, 255, 0.4), 0 0 16px rgba(58, 123, 213, 0.2); }
+            to { box-shadow: 0 0 12px rgba(0, 210, 255, 0.6), 0 0 24px rgba(58, 123, 213, 0.4); }
+        }
+        .segment-similarity {
+            font-size: 14px;
+            color: #666;
+            margin-left: 12px;
+        }
+        .segment-vad-confidence {
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 11px;
+            color: #666;
+            margin-left: 8px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.05);
+        }
+        .segment-vad-confidence.high {
+            color: #38ef7d;
+            background: rgba(56, 239, 125, 0.1);
+        }
+        .segment-vad-confidence.medium {
+            color: #ffd200;
+            background: rgba(255, 210, 0, 0.1);
+        }
+        .segment-vad-confidence.low {
+            color: #ff6b8a;
+            background: rgba(255, 107, 138, 0.1);
+        }
+        .timeline {
+            position: relative;
+            height: 40px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 8px;
+            margin-top: 20px;
+            overflow: hidden;
+        }
+        .timeline-segment {
+            position: absolute;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: 600;
+            color: white;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+            overflow: hidden;
+            white-space: nowrap;
+        }
+        .speaker-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 20px;
+        }
+        .speaker-badge {
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 14px;
+            background: rgba(255, 255, 255, 0.1);
+            box-shadow: 0 0 8px rgba(255, 255, 255, 0.15), 0 0 16px rgba(255, 255, 255, 0.1);
+            transition: box-shadow 0.3s ease;
+        }
+        .speaker-badge:hover {
+            box-shadow: 0 0 12px rgba(255, 255, 255, 0.25), 0 0 24px rgba(255, 255, 255, 0.15);
+        }
+        .live-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .live-dot {
+            width: 8px;
+            height: 8px;
+            background: #ff4b2b;
+            border-radius: 50%;
+            animation: blink 1s infinite;
+        }
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        .events-log {
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 12px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 8px;
+            padding: 12px;
+        }
+        .event-item {
+            padding: 4px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .event-item:last-child {
+            border-bottom: none;
+        }
+        .event-type {
+            color: #00d2ff;
+        }
+        .segment-play-icon {
+            color: #4a9eff;
+            font-size: 12px;
+            margin-left: auto;
+            opacity: 0.5;
+            transition: opacity 0.2s ease;
+        }
+        .segment:hover .segment-play-icon {
+            opacity: 1;
+        }
+        .segment-name-btn {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: #a0b0ff;
+            font-size: 11px;
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-left: 8px;
+            transition: all 0.2s ease;
+        }
+        .segment-name-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            border-color: rgba(255, 255, 255, 0.4);
+        }
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+        .modal-content {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 24px;
+            min-width: 320px;
+            max-width: 90vw;
+        }
+        .modal-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: #fff;
+        }
+        .modal-section {
+            margin-bottom: 16px;
+        }
+        .modal-section-title {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .modal-input {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.3);
+            color: #fff;
+            font-size: 14px;
+        }
+        .modal-input:focus {
+            outline: none;
+            border-color: #4a9eff;
+        }
+        .modal-speakers {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .modal-speaker-option {
+            padding: 8px 14px;
+            border-radius: 20px;
+            font-size: 13px;
+            cursor: pointer;
+            border: 2px solid transparent;
+            transition: all 0.2s ease;
+        }
+        .modal-speaker-option:hover {
+            transform: scale(1.05);
+        }
+        .modal-speaker-option.selected {
+            border-color: #fff;
+            box-shadow: 0 0 12px rgba(255, 255, 255, 0.3);
+        }
+        .modal-buttons {
+            display: flex;
+            gap: 12px;
+            justify-content: flex-end;
+            margin-top: 20px;
+        }
+        .modal-btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .modal-btn-cancel {
+            background: rgba(255, 255, 255, 0.1);
+            color: #888;
+        }
+        .modal-btn-cancel:hover {
+            background: rgba(255, 255, 255, 0.2);
+            color: #fff;
+        }
+        .modal-btn-save {
+            background: linear-gradient(135deg, #00d2ff, #3a7bd5);
+            color: white;
+        }
+        .modal-btn-save:hover {
+            transform: scale(1.05);
+            box-shadow: 0 4px 20px rgba(0, 210, 255, 0.4);
+        }
+        .modal-btn-save:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .modal-info {
+            font-size: 12px;
+            color: #666;
+            margin-top: 8px;
+        }
+        .btn-reprocess {
+            background: linear-gradient(135deg, #f7971e, #ffd200);
+            color: #1a1a2e;
+            padding: 8px 16px;
+            font-size: 13px;
+        }
+        .btn-reprocess:hover:not(:disabled) {
+            transform: scale(1.05);
+            box-shadow: 0 4px 20px rgba(247, 151, 30, 0.4);
+        }
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px;
+        }
+        .card-header h3 {
+            margin: 0;
+        }
+        .segment.active {
+            background: rgba(74, 158, 255, 0.2);
+            border: 1px solid rgba(74, 158, 255, 0.5);
+        }
+        .timeline-segment.active {
+            box-shadow: 0 0 0 2px #fff, 0 0 10px rgba(74, 158, 255, 0.8);
+            z-index: 10;
+        }
+        .timeline-info {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 8px;
+            padding: 8px 12px;
+            background: rgba(74, 158, 255, 0.1);
+            border-radius: 6px;
+            font-size: 13px;
+        }
+        .timeline-info-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .timeline-info-label {
+            color: #888;
+        }
+        .timeline-info-value {
+            color: #4a9eff;
+            font-weight: 600;
+            font-family: 'Monaco', 'Consolas', monospace;
+        }
+
+        /* Mobile-friendly responsive styles */
+        @media (max-width: 768px) {
+            body {
+                padding: 12px;
+            }
+            h1 {
+                font-size: 1.5rem;
+                margin-bottom: 16px;
+            }
+            .card {
+                padding: 16px;
+                margin-bottom: 12px;
+                border-radius: 12px;
+            }
+            .waveform-container {
+                padding: 12px;
+                min-height: 60px;
+                margin-bottom: 12px;
+            }
+            button {
+                padding: 10px 18px;
+                font-size: 14px;
+            }
+            .status {
+                padding: 8px;
+                margin-bottom: 12px;
+                font-size: 14px;
+            }
+            .segment {
+                padding: 10px 12px;
+                flex-wrap: wrap;
+                gap: 8px;
+            }
+            .segment-time {
+                font-size: 12px;
+                min-width: auto;
+            }
+            .segment-speaker {
+                padding: 3px 10px;
+                font-size: 13px;
+            }
+            .timeline {
+                height: 32px;
+            }
+            .timeline-segment {
+                font-size: 10px;
+            }
+            .speaker-list {
+                gap: 6px;
+            }
+            .speaker-badge {
+                padding: 4px 10px;
+                font-size: 12px;
+            }
+            .events-log {
+                font-size: 10px;
+                padding: 8px;
+                max-height: 150px;
+            }
+            .timeline-info {
+                flex-direction: column;
+                gap: 4px;
+                font-size: 11px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            body {
+                padding: 8px;
+            }
+            h1 {
+                font-size: 1.25rem;
+                margin-bottom: 12px;
+            }
+            .card {
+                padding: 12px;
+                margin-bottom: 10px;
+            }
+            .waveform-container {
+                padding: 8px;
+                min-height: 50px;
+                margin-bottom: 10px;
+            }
+            .segment-time {
+                width: 100%;
+                margin-bottom: 4px;
+            }
+            .segment-speaker {
+                flex: none;
+            }
+        }
+
+        /* Saved Recordings Styles */
+        .recordings-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .recording-item {
+            display: flex;
+            align-items: center;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            transition: all 0.2s ease;
+            gap: 12px;
+        }
+        .recording-item:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+        .recording-icon {
+            font-size: 24px;
+            opacity: 0.7;
+        }
+        .recording-info {
+            flex: 1;
+            min-width: 0;
+        }
+        .recording-name {
+            font-weight: 600;
+            font-size: 14px;
+            color: #fff;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .recording-meta {
+            font-size: 12px;
+            color: #888;
+            display: flex;
+            gap: 12px;
+            margin-top: 4px;
+        }
+        .recording-actions {
+            display: flex;
+            gap: 8px;
+        }
+        .btn-small {
+            padding: 6px 12px;
+            font-size: 12px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .btn-load {
+            background: linear-gradient(135deg, #11998e, #38ef7d);
+            color: white;
+        }
+        .btn-load:hover {
+            transform: scale(1.05);
+            box-shadow: 0 2px 10px rgba(56, 239, 125, 0.3);
+        }
+        .btn-delete {
+            background: rgba(255, 65, 108, 0.2);
+            color: #ff6b8a;
+        }
+        .btn-delete:hover {
+            background: rgba(255, 65, 108, 0.4);
+        }
+        .btn-save {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+        }
+        .btn-save:hover:not(:disabled) {
+            transform: scale(1.05);
+            box-shadow: 0 4px 20px rgba(102, 126, 234, 0.4);
+        }
+        .btn-share {
+            background: linear-gradient(135deg, #00d2ff, #3a7bd5);
+            color: white;
+        }
+        .btn-share:hover:not(:disabled) {
+            transform: scale(1.05);
+            box-shadow: 0 4px 20px rgba(0, 210, 255, 0.4);
+        }
+        .empty-state {
+            text-align: center;
+            padding: 24px;
+            color: #666;
+            font-size: 14px;
+        }
+        .save-recording-form {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 16px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .save-recording-form input {
+            flex: 1;
+            padding: 10px 12px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.3);
+            color: #fff;
+            font-size: 14px;
+        }
+        .save-recording-form input:focus {
+            outline: none;
+            border-color: #4a9eff;
+        }
+        .card-title-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px;
+        }
+        .card-title-row h3 {
+            margin: 0;
+        }
+        .btn-refresh {
+            background: rgba(255, 255, 255, 0.1);
+            color: #888;
+            padding: 6px 10px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s ease;
+        }
+        .btn-refresh:hover {
+            background: rgba(255, 255, 255, 0.2);
+            color: #fff;
+        }
+    </style>
 </head>
 <body>
     <div id="root"></div>
@@ -29,7 +695,7 @@
         ];
 
         function getSpeakerColor(speaker, speakerMap) {
-            if (!speaker || speaker.startsWith('unknown_')) return 'rgba(128, 128, 128, 0.5)';
+            if (!speaker) return 'rgba(128, 128, 128, 0.5)';
             if (!speakerMap.has(speaker)) {
                 speakerMap.set(speaker, SPEAKER_COLORS[speakerMap.size % SPEAKER_COLORS.length]);
             }
@@ -51,6 +717,7 @@
             const [audioBlob, setAudioBlob] = useState(null);
             const [duration, setDuration] = useState(0);
             const [segments, setSegments] = useState([]);
+            const [refinedSegments, setRefinedSegments] = useState([]); // TS-VAD refined segments
             const [events, setEvents] = useState([]);
             const [speakers, setSpeakers] = useState([]);
             const [speakerMap] = useState(new Map());
@@ -60,6 +727,7 @@
             const [selectedExistingSpeaker, setSelectedExistingSpeaker] = useState(null);
             const [isSaving, setIsSaving] = useState(false);
             const [knownSpeakers, setKnownSpeakers] = useState([]);
+            const [unknownSpeakers, setUnknownSpeakers] = useState([]); // unknown speaker clusters from TS-VAD
             
             // Saved recordings state
             const [savedRecordings, setSavedRecordings] = useState([]);
@@ -75,13 +743,6 @@
             const [segmentSimilarities, setSegmentSimilarities] = useState({}); // {"start-end": similarity}
             const [identifyingSegment, setIdentifyingSegment] = useState(null); // segment being identified
             const [segmentIdentifications, setSegmentIdentifications] = useState({}); // {"start-end": {matches, top_match}}
-            
-            // Diarization mode state
-            const [diarizationMode, setDiarizationMode] = useState(() => {
-                return localStorage.getItem('diarizationMode') || 'fast';
-            });
-            const [refinedSegments, setRefinedSegments] = useState([]);
-            const [unknownSpeakers, setUnknownSpeakers] = useState([]);
 
             const waveformRef = useRef(null);
             const playbackWaveformRef = useRef(null);
@@ -100,24 +761,34 @@
             const analyserRef = useRef(null);
             const animationRef = useRef(null);
 
-            const handleModeChange = (e) => {
-                const newMode = e.target.value;
-                localStorage.setItem('diarizationMode', newMode);
-                setDiarizationMode(newMode);
-                
-                // Clear refined segments if switching to fast mode
-                if (newMode === 'fast') {
-                    setRefinedSegments([]);
-                    setUnknownSpeakers([]);
+            const pickSupportedAudioMimeType = useCallback(() => {
+                if (!window.MediaRecorder || typeof MediaRecorder.isTypeSupported !== 'function') {
+                    return null;
                 }
-            };
 
-            // Memoize displaySegments to prevent unnecessary re-renders
-            const displaySegments = React.useMemo(() => {
-                return (diarizationMode === 'accurate' && refinedSegments.length > 0)
-                    ? refinedSegments
-                    : segments;
-            }, [diarizationMode, refinedSegments, segments]);
+                const candidates = [
+                    'audio/webm;codecs=opus',
+                    'audio/webm',
+                    'audio/mp4',
+                ];
+
+                for (const candidate of candidates) {
+                    try {
+                        if (MediaRecorder.isTypeSupported(candidate)) return candidate;
+                    } catch (_) {
+                        // ignore
+                    }
+                }
+
+                return null;
+            }, []);
+
+            const filenameForBlob = useCallback((blob) => {
+                const type = (blob && blob.type) ? blob.type : '';
+                if (type.includes('webm')) return 'recording.webm';
+                if (type.includes('mp4')) return 'recording.mp4';
+                return 'recording.audio';
+            }, []);
 
             // Initialize recording waveform
             useEffect(() => {
@@ -246,25 +917,27 @@
 
             const startRecording = useCallback(async () => {
                 try {
+                    // Note: Don't specify sampleRate - browsers don't support it well
+                    // The backend will resample to 16kHz via ffmpeg
                     const stream = await navigator.mediaDevices.getUserMedia({ 
                         audio: {
-                            channelCount: 1,
-                            sampleRate: 16000,
                             echoCancellation: true,
-                            noiseSuppression: true
+                            noiseSuppression: true,
+                            autoGainControl: true
                         } 
                     });
                     streamRef.current = stream;
+                    console.log('[Recording] Got media stream:', stream.getAudioTracks()[0]?.getSettings());
 
                     // Clear previous state
                     audioChunksRef.current = [];
                     lastProcessedChunkRef.current = 0;
                     processingRef.current = false;
                     setSegments([]);
-                    setEvents([]);
-                    setSpeakers([]);
                     setRefinedSegments([]);
                     setUnknownSpeakers([]);
+                    setEvents([]);
+                    setSpeakers([]);
                     speakerMap.clear();
                     setActiveSegment(null);
                     activeSegmentRef.current = null;
@@ -283,21 +956,24 @@
                     setAudioBlob(null);
 
                     // Create MediaRecorder
-                    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
-                        ? 'audio/webm;codecs=opus' 
-                        : 'audio/webm';
-                    
-                    mediaRecorderRef.current = new MediaRecorder(stream, { mimeType });
+                    const mimeType = pickSupportedAudioMimeType();
+                    console.log('[Recording] Using mimeType:', mimeType);
+                    const recorderOptions = mimeType ? { mimeType } : undefined;
+                    mediaRecorderRef.current = new MediaRecorder(stream, recorderOptions);
+                    console.log('[Recording] MediaRecorder created, state:', mediaRecorderRef.current.state);
 
                     mediaRecorderRef.current.ondataavailable = async (event) => {
+                        console.log('[Recording] ondataavailable, size:', event.data.size, 'type:', event.data.type);
                         if (event.data.size > 0) {
                             audioChunksRef.current.push(event.data);
+                            console.log('[Recording] Total chunks:', audioChunksRef.current.length);
                             
                             // Stream to backend every 3 chunks (3 seconds) for real-time results
                             if (audioChunksRef.current.length >= 3 && 
                                 audioChunksRef.current.length % 2 === 0 &&
                                 !processingRef.current) {
-                                const blob = new Blob(audioChunksRef.current, { type: mimeType });
+                                const blob = new Blob(audioChunksRef.current, { type: mimeType || event.data.type });
+                                console.log('[Recording] Sending partial blob, size:', blob.size);
                                 // Process in background, don't await
                                 processStreamingDiarization(blob, true);
                             }
@@ -305,28 +981,39 @@
                     };
 
                     mediaRecorderRef.current.onstop = async () => {
-                        const blob = new Blob(audioChunksRef.current, { type: mimeType });
+                        console.log('[Recording] onstop, total chunks:', audioChunksRef.current.length);
+                        const blobType = mimeType || (audioChunksRef.current[0] && audioChunksRef.current[0].type) || 'audio/webm';
+                        const blob = new Blob(audioChunksRef.current, { type: blobType });
+                        console.log('[Recording] Final blob size:', blob.size, 'type:', blob.type);
                         setAudioBlob(blob);
-                        
-                        // Final diarization with complete audio
-                        await processStreamingDiarization(blob, false);
-                        
-                        // Run TS-VAD if accurate mode
-                        if (diarizationMode === 'accurate') {
+
+                        try {
+                            // Final diarization with complete audio (coarse streaming)
+                            await processStreamingDiarization(blob, false);
+
+                            //Run TS-VAD refinement pass (optional - comment out if causing issues)
                             await processRefinedDiarization(blob);
+                        } finally {
+                            if (streamRef.current) {
+                                streamRef.current.getTracks().forEach(track => track.stop());
+                                streamRef.current = null;
+                            }
+                            if (audioContextRef.current) {
+                                audioContextRef.current.close();
+                                audioContextRef.current = null;
+                            }
                         }
                     };
 
-                    // Start recording with timeslice for streaming (1 second chunks)
-                    mediaRecorderRef.current.start(1000);
-                    setIsRecording(true);
-                    setIsPaused(false);
-                    setStatus('recording');
-                    setStatusText('Recording... Results will appear in real-time');
-
-                    // Start live visualization using AudioContext
+                    // Start live visualization using AudioContext BEFORE starting MediaRecorder
+                    // This ensures the analyser is ready when recording begins
                     const audioContext = new AudioContext();
                     audioContextRef.current = audioContext;
+                    if (audioContext.state === 'suspended') {
+                        await audioContext.resume();
+                    }
+                    console.log('[Recording] AudioContext state:', audioContext.state);
+                    
                     const source = audioContext.createMediaStreamSource(stream);
                     const analyser = audioContext.createAnalyser();
                     analyserRef.current = analyser;
@@ -336,8 +1023,18 @@
                     const bufferLength = analyser.frequencyBinCount;
                     const dataArray = new Uint8Array(bufferLength);
 
+                    // Start the waveform animation loop
                     const drawWaveform = () => {
-                        if (mediaRecorderRef.current?.state !== 'recording') {
+                        // Continue drawing even if MediaRecorder hasn't started yet
+                        if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') {
+                            // Keep trying until recording starts, or we're stopped
+                            if (streamRef.current) {
+                                animationRef.current = requestAnimationFrame(drawWaveform);
+                            }
+                            return;
+                        }
+                        
+                        if (mediaRecorderRef.current.state !== 'recording' && mediaRecorderRef.current.state !== 'paused') {
                             animationRef.current = null;
                             return;
                         }
@@ -391,35 +1088,37 @@
                         // Add glow effect based on intensity
                         const average = dataArray.reduce((a, b) => a + Math.abs(b - 128), 0) / bufferLength;
                         const intensity = Math.min(average / 50, 1);
-                        waveformRef.current.style.boxShadow = `inset 0 0 ${20 + intensity * 30}px rgba(74, 158, 255, ${intensity * 0.5})`;
+                        if (waveformRef.current) {
+                            waveformRef.current.style.boxShadow = `inset 0 0 ${20 + intensity * 30}px rgba(74, 158, 255, ${intensity * 0.5})`;
+                        }
                     };
                     
+                    // Start waveform animation immediately
                     drawWaveform();
+
+                    // Now start recording with timeslice for streaming (1 second chunks)
+                    mediaRecorderRef.current.start(1000);
+                    console.log('[Recording] MediaRecorder started, state:', mediaRecorderRef.current.state);
+                    setIsRecording(true);
+                    setIsPaused(false);
+                    setStatus('recording');
+                    setStatusText('Recording... Results will appear in real-time');
 
                 } catch (error) {
                     console.error('Error starting recording:', error);
                     setStatus('ready');
                     setStatusText('Error: Could not access microphone');
                 }
-            }, [speakerMap, processStreamingDiarization, processRefinedDiarization, diarizationMode]);
+            }, [speakerMap, processStreamingDiarization, processRefinedDiarization, pickSupportedAudioMimeType]);
 
             const stopRecording = useCallback(() => {
                 if (mediaRecorderRef.current && (mediaRecorderRef.current.state === 'recording' || mediaRecorderRef.current.state === 'paused')) {
                     mediaRecorderRef.current.stop();
                 }
-                if (streamRef.current) {
-                    streamRef.current.getTracks().forEach(track => track.stop());
-                    streamRef.current = null;
-                }
                 // Cancel animation frame
                 if (animationRef.current) {
                     cancelAnimationFrame(animationRef.current);
                     animationRef.current = null;
-                }
-                // Close audio context
-                if (audioContextRef.current) {
-                    audioContextRef.current.close();
-                    audioContextRef.current = null;
                 }
                 setIsRecording(false);
                 setIsPaused(false);
@@ -454,10 +1153,10 @@
 
                 try {
                     const formData = new FormData();
-                    formData.append('file', blob, 'recording.webm');
+                    formData.append('file', blob, filenameForBlob(blob));
                     formData.append('response_format', 'diarized_json');
                     formData.append('stream', 'true');
-                    formData.append('vad', 'true');
+                    formData.append('vad', 'false');
                     formData.append('chunk_size', '2.0');
                     formData.append('chunk_hop', '0.5');
 
@@ -474,11 +1173,22 @@
                     const decoder = new TextDecoder();
                     let buffer = '';
 
-                    // Collect all segments and events from this response before updating state
+                    // Incrementally apply events so UI updates in real-time
                     const newSegments = [];
                     const newEvents = [];
                     let newDuration = duration;
                     let newSpeakers = speakers;
+
+                    let lastUiUpdateAt = 0;
+                    const maybeUpdateUi = (force = false) => {
+                        const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                        if (!force && (now - lastUiUpdateAt) < 100) return;
+                        lastUiUpdateAt = now;
+                        setSegments([...newSegments]);
+                        setEvents([...newEvents]);
+                        setDuration(newDuration);
+                        setSpeakers(newSpeakers);
+                    };
 
                     while (true) {
                         const { done, value } = await reader.read();
@@ -505,10 +1215,13 @@
                                                 start: event.start,
                                                 end: event.end,
                                                 speaker: event.speaker,
+                                                similarity: event.similarity,
                                                 vad_confidence: event.vad_confidence
                                             });
                                             break;
                                     }
+
+                                    maybeUpdateUi(false);
                                 } catch (e) {
                                     console.error('Error parsing event:', e);
                                 }
@@ -516,18 +1229,32 @@
                         }
                     }
 
-                    // Batch update state once after all data is collected (prevents flicker)
-                    if (isPartial) {
-                        // For partial updates, replace all segments at once
-                        setSegments(newSegments);
-                        setEvents(newEvents);
-                    } else {
-                        // For final update, replace everything
-                        setSegments(newSegments);
-                        setEvents(newEvents);
+                    // Flush any remaining buffered line
+                    if (buffer.trim()) {
+                        try {
+                            const event = JSON.parse(buffer);
+                            newEvents.push(event);
+                            switch (event.event) {
+                                case 'start':
+                                    newDuration = event.duration;
+                                    newSpeakers = event.speakers || [];
+                                    break;
+                                case 'segment':
+                                    newSegments.push({
+                                        start: event.start,
+                                        end: event.end,
+                                        speaker: event.speaker,
+                                        similarity: event.similarity,
+                                        vad_confidence: event.vad_confidence
+                                    });
+                                    break;
+                            }
+                        } catch (e) {
+                            console.error('Error parsing event:', e);
+                        }
                     }
-                    setDuration(newDuration);
-                    setSpeakers(newSpeakers);
+
+                    maybeUpdateUi(true);
 
                     if (!isPartial) {
                         setStatus('ready');
@@ -543,7 +1270,7 @@
                 } finally {
                     processingRef.current = false;
                 }
-            }, [duration, speakers]);
+            }, [duration, speakers, filenameForBlob]);
 
             const processRefinedDiarization = useCallback(async (blob) => {
                 try {
@@ -551,10 +1278,13 @@
                     setStatusText('Running TS-VAD refinement...');
 
                     const formData = new FormData();
-                    formData.append('file', blob, 'recording.webm');
+                    formData.append('file', blob, filenameForBlob(blob));
                     formData.append('response_format', 'diarized_json');
                     formData.append('stream', 'false');
                     formData.append('diarization_mode', 'ts_vad');
+                    formData.append('window_size', '2.0');
+                    formData.append('window_hop', '0.5');
+                    formData.append('vad', 'true');
 
                     const response = await fetch('/v1/audio/transcriptions', {
                         method: 'POST',
@@ -562,25 +1292,36 @@
                     });
 
                     if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                        throw new Error(`HTTP error! status: ${response.status}`);
                     }
 
                     const result = await response.json();
 
+                    // Update refined segments and unknown speakers
                     setRefinedSegments(result.segments || []);
                     setUnknownSpeakers(result.unknown_speakers || []);
-                    setKnownSpeakers(prev => [...new Set([...prev, ...(result.known_speakers || [])])]);
-                    
+                    setKnownSpeakers(result.known_speakers || []);
+
+                    // Add TS-VAD events to event log
+                    const tsVadEvents = [
+                        { event: 'ts_vad_start', mode: result.mode, duration: result.duration },
+                        ...(result.segments || []).map(seg => ({
+                            event: 'segment',
+                            ...seg
+                        })),
+                        { event: 'ts_vad_done', unknown_count: result.unknown_speakers?.length || 0 }
+                    ];
+                    setEvents(prev => [...prev, ...tsVadEvents]);
+
                     setStatus('ready');
                     setStatusText('TS-VAD refinement complete');
+
                 } catch (error) {
                     console.error('Error processing TS-VAD refinement:', error);
                     setStatus('ready');
-                    setStatusText('TS-VAD refinement failed - showing streaming results');
-                    alert(`TS-VAD refinement failed: ${error.message}`);
-                    setRefinedSegments([]);
+                    setStatusText('Error in TS-VAD refinement');
                 }
-            }, []);
+            }, [filenameForBlob]);
 
             const togglePlayback = useCallback(() => {
                 if (playbackWavesurferRef.current) {
@@ -714,7 +1455,7 @@
                 setIsSavingRecording(true);
                 try {
                     const formData = new FormData();
-                    formData.append('file', audioBlob, 'recording.webm');
+                    formData.append('file', audioBlob, filenameForBlob(audioBlob));
                     formData.append('name', recordingName.trim() || `Recording ${new Date().toLocaleString()}`);
                     formData.append('duration', duration.toString());
                     
@@ -740,7 +1481,7 @@
                 } finally {
                     setIsSavingRecording(false);
                 }
-            }, [audioBlob, recordingName, duration, fetchRecordings, isSavingRecording]);
+            }, [audioBlob, recordingName, duration, fetchRecordings, isSavingRecording, filenameForBlob]);
             
             // Load a saved recording
             const loadRecording = useCallback(async (recording) => {
@@ -765,10 +1506,10 @@
                     
                     // Clear previous state
                     setSegments([]);
-                    setEvents([]);
-                    setSpeakers([]);
                     setRefinedSegments([]);
                     setUnknownSpeakers([]);
+                    setEvents([]);
+                    setSpeakers([]);
                     speakerMap.clear();
                     setActiveSegment(null);
                     activeSegmentRef.current = null;
@@ -782,13 +1523,11 @@
                     // Set the audio blob (this will trigger playback waveform creation)
                     setAudioBlob(blob);
                     
-                    // Process diarization
+                    // Process diarization (coarse streaming)
                     await processStreamingDiarization(blob, false);
                     
-                    // Run TS-VAD if accurate mode
-                    if (diarizationMode === 'accurate') {
-                        await processRefinedDiarization(blob);
-                    }
+                    // Process TS-VAD refinement (optional - uncomment to enable)
+                    await processRefinedDiarization(blob);
                     
                 } catch (error) {
                     console.error('Error loading recording:', error);
@@ -797,7 +1536,7 @@
                 } finally {
                     setIsLoadingRecording(false);
                 }
-            }, [isLoadingRecording, isRecording, processStreamingDiarization, processRefinedDiarization, diarizationMode, speakerMap]);
+            }, [isLoadingRecording, isRecording, processStreamingDiarization, processRefinedDiarization, speakerMap]);
             
             // Delete a saved recording
             const deleteRecording = useCallback(async (recording, e) => {
@@ -863,7 +1602,7 @@
                 setIsSaving(true);
                 try {
                     const formData = new FormData();
-                    formData.append('file', audioBlob, 'recording.webm');
+                    formData.append('file', audioBlob, filenameForBlob(audioBlob));
                     formData.append('name', speakerName);
                     formData.append('start', namingSegment.start.toString());
                     formData.append('end', namingSegment.end.toString());
@@ -881,18 +1620,21 @@
                     const result = await response.json();
                     console.log('Speaker saved:', result);
                     
-                    // Update ALL segments with the same speaker cluster label
-                    const oldSpeakerLabel = namingSegment.speaker;
+                    // Update the segment with the new speaker name in both segment arrays
                     setSegments(prev => prev.map(seg => 
-                        seg.speaker === oldSpeakerLabel ? { ...seg, speaker: speakerName } : seg
+                        seg.start === namingSegment.start && seg.end === namingSegment.end
+                            ? { ...seg, speaker: speakerName }
+                            : seg
                     ));
-                    setRefinedSegments(prev => prev.map(seg =>
-                        seg.speaker === oldSpeakerLabel ? { ...seg, speaker: speakerName } : seg
+                    setRefinedSegments(prev => prev.map(seg => 
+                        seg.start === namingSegment.start && seg.end === namingSegment.end
+                            ? { ...seg, speaker: speakerName }
+                            : seg
                     ));
-
+                    
                     // Remove from unknown speakers if it was an unknown cluster
-                    if (oldSpeakerLabel && oldSpeakerLabel.startsWith('unknown_')) {
-                        setUnknownSpeakers(prev => prev.filter(u => u !== oldSpeakerLabel));
+                    if (namingSegment.speaker && namingSegment.speaker.startsWith('unknown_')) {
+                        setUnknownSpeakers(prev => prev.filter(u => u !== namingSegment.speaker));
                     }
                     
                     // Update known speakers list
@@ -910,7 +1652,7 @@
                 } finally {
                     setIsSaving(false);
                 }
-            }, [namingSegment, audioBlob, selectedExistingSpeaker, newSpeakerName, knownSpeakers, speakerMap, closeNamingModal]);
+            }, [namingSegment, audioBlob, selectedExistingSpeaker, newSpeakerName, knownSpeakers, speakerMap, closeNamingModal, filenameForBlob]);
 
             const reprocessAudio = useCallback(async () => {
                 if (!audioBlob || processingRef.current) return;
@@ -921,11 +1663,9 @@
                 // Clear segments to show fresh results
                 await processStreamingDiarization(audioBlob, false);
                 
-                // Run TS-VAD if accurate mode
-                if (diarizationMode === 'accurate') {
-                    await processRefinedDiarization(audioBlob);
-                }
-            }, [audioBlob, processStreamingDiarization, processRefinedDiarization, diarizationMode]);
+                // Also re-run TS-VAD refinement (optional)
+                await processRefinedDiarization(audioBlob);
+            }, [audioBlob, processStreamingDiarization, processRefinedDiarization]);
 
             // Compare all segments against a specific speaker
             const compareToSpeaker = useCallback(async (speakerName) => {
@@ -943,7 +1683,7 @@
                 
                 try {
                     const formData = new FormData();
-                    formData.append('file', audioBlob, 'recording.webm');
+                    formData.append('file', audioBlob, filenameForBlob(audioBlob));
                     formData.append('segments', JSON.stringify(segments.map(s => ({ start: s.start, end: s.end }))));
                     
                     const response = await fetch(`/v1/speakers/${encodeURIComponent(speakerName)}/compare`, {
@@ -966,7 +1706,7 @@
                     console.error('Error comparing to speaker:', error);
                     setCompareSpeaker(null);
                 }
-            }, [audioBlob, segments, compareSpeaker]);
+            }, [audioBlob, segments, compareSpeaker, filenameForBlob]);
 
             // Identify a single segment against speaker database
             const identifySegment = useCallback(async (seg, e) => {
@@ -978,7 +1718,7 @@
                 
                 try {
                     const formData = new FormData();
-                    formData.append('file', audioBlob, 'recording.webm');
+                    formData.append('file', audioBlob, filenameForBlob(audioBlob));
                     formData.append('start', seg.start.toString());
                     formData.append('end', seg.end.toString());
                     
@@ -1004,11 +1744,6 @@
                                 ? { ...s, speaker: result.top_match.name }
                                 : s
                         ));
-                        setRefinedSegments(prev => prev.map(s =>
-                            s.start === seg.start && s.end === seg.end
-                                ? { ...s, speaker: result.top_match.name }
-                                : s
-                        ));
                         // Update speaker color
                         getSpeakerColor(result.top_match.name, speakerMap);
                     }
@@ -1017,7 +1752,7 @@
                 } finally {
                     setIdentifyingSegment(null);
                 }
-            }, [audioBlob, speakerMap]);
+            }, [audioBlob, speakerMap, filenameForBlob]);
 
             return (
                 <div className="container">
@@ -1039,7 +1774,7 @@
                                     ref={canvasRef} 
                                     width={800} 
                                     height={50}
-                                    style={{ width: '100%', height: '50px', borderRadius: '8px' }}
+                                    style={{ width: '100%', height: '50px', borderRadius: '8px', position: 'relative', zIndex: 2 }}
                                 />
                             ) : !audioBlob ? (
                                 <div style={{ 
@@ -1055,24 +1790,6 @@
                         </div>
 
                         <div className="controls">
-                            <select
-                                value={diarizationMode}
-                                onChange={handleModeChange}
-                                disabled={isRecording}
-                                style={{
-                                    padding: '8px 12px',
-                                    fontSize: '14px',
-                                    background: 'rgba(255,255,255,0.1)',
-                                    color: '#fff',
-                                    border: '1px solid rgba(255,255,255,0.2)',
-                                    borderRadius: '6px',
-                                    marginRight: '12px',
-                                    cursor: isRecording ? 'not-allowed' : 'pointer'
-                                }}
-                            >
-                                <option value="fast" style={{ background: '#1a1a2e' }}>⚡ Fast</option>
-                                <option value="accurate" style={{ background: '#1a1a2e' }}>🎯 Accurate</option>
-                            </select>
                             {!isRecording ? (
                                 <button 
                                     className="btn-record" 
@@ -1099,6 +1816,67 @@
                                 </>
                             )}
                         </div>
+                        
+                        {/* Live diarization display during recording */}
+                        {isRecording && segments.length > 0 && (
+                            <div style={{ marginTop: '16px' }}>
+                                <div style={{ 
+                                    display: 'flex', 
+                                    alignItems: 'center', 
+                                    gap: '8px',
+                                    marginBottom: '12px',
+                                    color: '#4a9eff'
+                                }}>
+                                    <span className="live-dot" style={{ width: '8px', height: '8px', background: '#ff416c', borderRadius: '50%', animation: 'pulse 1.5s infinite' }}></span>
+                                    <span style={{ fontWeight: 600 }}>Live Speaker Detection</span>
+                                    <span style={{ color: '#888', fontSize: '13px' }}>({segments.length} segments)</span>
+                                </div>
+                                <div className="diarization-results" style={{ maxHeight: '200px', overflowY: 'auto' }}>
+                                    {segments.slice().reverse().map((seg, i) => {
+                                        const isUnknownSpeaker = seg.speaker && seg.speaker.startsWith('unknown_');
+                                        const displaySpeaker = isUnknownSpeaker 
+                                            ? `Unknown (${seg.speaker})`
+                                            : (seg.speaker || 'Unknown Speaker');
+                                        const similarityPercent = seg.similarity ? Math.round(seg.similarity * 100) : null;
+                                        const similarityColor = seg.similarity >= 0.7 ? '#38ef7d' : seg.similarity >= 0.5 ? '#ffd200' : '#ff6b8a';
+                                        return (
+                                            <div 
+                                                key={i} 
+                                                className="segment"
+                                                style={{ 
+                                                    opacity: i === 0 ? 1 : 0.7,
+                                                    transition: 'opacity 0.3s'
+                                                }}
+                                            >
+                                                <span className="segment-time">
+                                                    {formatTime(seg.start)} → {formatTime(seg.end)}
+                                                </span>
+                                                <span 
+                                                    className={`segment-speaker ${seg.speaker && !isUnknownSpeaker ? 'known' : 'unknown'}`}
+                                                    style={seg.speaker && !isUnknownSpeaker ? { background: getSpeakerColor(seg.speaker, speakerMap) } : {}}
+                                                >
+                                                    {displaySpeaker}
+                                                </span>
+                                                {similarityPercent !== null && (
+                                                    <span 
+                                                        style={{
+                                                            color: similarityColor,
+                                                            fontWeight: 600,
+                                                            fontSize: '12px',
+                                                            marginLeft: '8px',
+                                                            fontFamily: "'Monaco', 'Consolas', monospace"
+                                                        }}
+                                                        title={`Speaker match confidence: ${similarityPercent}%`}
+                                                    >
+                                                        {similarityPercent}%
+                                                    </span>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        )}
                     </div>
 
                     {audioBlob && (
@@ -1256,20 +2034,18 @@
                         </div>
                     )}
 
-                    {segments.length > 0 && (
+                    {audioBlob && (
                         <div className="card">
                             <div className="card-header">
                                 <h3>🎯 Speaker Diarization</h3>
-                                {audioBlob && (
-                                    <button 
-                                        className="btn-reprocess" 
-                                        onClick={reprocessAudio}
-                                        disabled={status === 'processing' || isRecording}
-                                        title="Re-analyze audio with updated speaker database"
-                                    >
-                                        🔄 Reprocess
-                                    </button>
-                                )}
+                                <button 
+                                    className="btn-reprocess" 
+                                    onClick={reprocessAudio}
+                                    disabled={status === 'processing' || isRecording}
+                                    title="Re-analyze audio with updated speaker database"
+                                >
+                                    🔄 Reprocess
+                                </button>
                             </div>
                             
                             {speakers.length > 0 && (
@@ -1322,27 +2098,34 @@
                                         }
                                     }}
                                 >
-                                    {displaySegments.map((seg, i) => {
+                                    {(() => {
+                                        const allSegments = [...(refinedSegments || []), ...(segments || [])].filter(s => s);
+                                        return allSegments.sort((a, b) => a.start - b.start).map((seg, i) => {
                                         const left = (seg.start / duration) * 100;
                                         const width = ((seg.end - seg.start) / duration) * 100;
                                         const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
+                                        const isUnknownSpeaker = seg.speaker && seg.speaker.startsWith('unknown_');
+                                        const displaySpeaker = isUnknownSpeaker 
+                                            ? seg.speaker.replace('unknown_', 'U')
+                                            : (seg.speaker || '?');
                                         return (
                                             <div
-                                                key={`${seg.start}-${seg.end}-${seg.speaker || 'unknown'}`}
+                                                key={i}
                                                 className={`timeline-segment ${isActive ? 'active' : ''}`}
                                                 onClick={() => seekToSegment(seg)}
                                                 style={{
                                                     left: `${left}%`,
                                                     width: `${width}%`,
-                                                    background: getSpeakerColor(seg.speaker, speakerMap),
+                                                    background: (seg.speaker && !isUnknownSpeaker) ? getSpeakerColor(seg.speaker, speakerMap) : '#666',
                                                     cursor: audioBlob ? 'pointer' : 'default'
                                                 }}
                                                 title={`${seg.speaker || 'Unknown'}: ${formatTime(seg.start)} - ${formatTime(seg.end)}${audioBlob ? ' (click to play)' : ''}`}
                                             >
-                                                {width > 10 ? (seg.speaker || '?') : ''}
+                                                {width > 10 ? displaySpeaker : ''}
                                             </div>
                                         );
-                                    })}
+                                        });
+                                    })()}
                                 </div>
                                 {activeSegment && (
                                     <div className="timeline-info">
@@ -1382,13 +2165,20 @@
                             )}
 
                             <div className="diarization-results">
-                                {displaySegments.map((seg, i) => {
+                                {(() => {
+                                    const allSegments = [...(refinedSegments || []), ...(segments || [])].filter(s => s);
+                                    return allSegments.sort((a, b) => a.start - b.start).map((seg, i) => {
                                     const isActive = activeSegment && activeSegment.start === seg.start && activeSegment.end === seg.end;
                                     const segKey = `${seg.start}-${seg.end}`;
                                     const similarity = segmentSimilarities[segKey];
+                                    const isUnknownSpeaker = seg.speaker && seg.speaker.startsWith('unknown_');
+                                    const displaySpeaker = isUnknownSpeaker 
+                                        ? `Unknown (${seg.speaker})`
+                                        : (seg.speaker || 'Unknown Speaker');
+                                    
                                     return (
                                     <div 
-                                        key={`${seg.start}-${seg.end}-${seg.speaker || 'unknown'}`}
+                                        key={i} 
                                         className={`segment ${isActive ? 'active' : ''}`}
                                         onClick={() => seekToSegment(seg)}
                                         style={{ cursor: audioBlob ? 'pointer' : 'default' }}
@@ -1397,6 +2187,22 @@
                                         <span className="segment-time">
                                             {formatTime(seg.start)} → {formatTime(seg.end)}
                                         </span>
+                                        {seg.cause && (
+                                            <span 
+                                                style={{
+                                                    fontSize: '10px',
+                                                    padding: '2px 6px',
+                                                    borderRadius: '4px',
+                                                    background: seg.cause === 'ts_vad' ? 'rgba(56, 239, 125, 0.2)' : 'rgba(74, 158, 255, 0.2)',
+                                                    color: seg.cause === 'ts_vad' ? '#38ef7d' : '#4a9eff',
+                                                    fontWeight: 600,
+                                                    marginLeft: '4px'
+                                                }}
+                                                title={seg.cause === 'ts_vad' ? 'TS-VAD refined segment' : 'Streaming coarse segment'}
+                                            >
+                                                {seg.cause === 'ts_vad' ? '🎯 TS-VAD' : '🌊 Stream'}
+                                            </span>
+                                        )}
                                         {seg.vad_confidence !== undefined && (
                                             <span 
                                                 className={`segment-vad-confidence ${seg.vad_confidence >= 0.8 ? 'high' : seg.vad_confidence >= 0.5 ? 'medium' : 'low'}`}
@@ -1406,11 +2212,28 @@
                                             </span>
                                         )}
                                         <span 
-                                            className={`segment-speaker ${seg.speaker ? 'known' : 'unknown'}`}
-                                            style={seg.speaker ? { background: getSpeakerColor(seg.speaker, speakerMap) } : {}}
+                                            className={`segment-speaker ${seg.speaker && !isUnknownSpeaker ? 'known' : 'unknown'}`}
+                                            style={seg.speaker && !isUnknownSpeaker ? { background: getSpeakerColor(seg.speaker, speakerMap) } : {}}
                                         >
-                                            {seg.speaker || 'Unknown Speaker'}
+                                            {displaySpeaker}
                                         </span>
+                                        {/* Show segment's intrinsic similarity (from backend) when not comparing */}
+                                        {!compareSpeaker && seg.similarity !== undefined && seg.similarity !== null && (
+                                            <span 
+                                                className="segment-similarity"
+                                                style={{
+                                                    color: seg.similarity >= 0.7 ? '#38ef7d' : seg.similarity >= 0.5 ? '#ffd200' : '#ff6b8a',
+                                                    fontWeight: 600,
+                                                    fontSize: '13px',
+                                                    marginLeft: '8px',
+                                                    fontFamily: "'Monaco', 'Consolas', monospace"
+                                                }}
+                                                title={`Speaker match confidence: ${(seg.similarity * 100).toFixed(1)}%`}
+                                            >
+                                                {(seg.similarity * 100).toFixed(0)}%
+                                            </span>
+                                        )}
+                                        {/* Show comparison similarity when comparing to a specific speaker */}
                                         {compareSpeaker && similarity !== undefined && (
                                             <span 
                                                 className="segment-similarity"
@@ -1463,7 +2286,8 @@
                                         )}
                                     </div>
                                     );
-                                })}
+                                    });
+                                })()}
                             </div>
                         </div>
                     )}

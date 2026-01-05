@@ -18,6 +18,7 @@ Watch a video: https://youtu.be/-kvUzvcfD6o
 - **Web UI**: React-based voice recorder with Fast/Accurate mode selector
 - **Format Support**: WAV, M4A, MP3, AAC, FLAC, OGG, and more (via ffmpeg)
 - **GPU Acceleration**: CUDA and Metal (MPS) support
+- **CPU Compatibility**: Automatic tensor layout fixes for CPU-based NeMo MSDD processing
 
 ## Installation
 
@@ -165,11 +166,12 @@ vectorme --file audio.wav --format numpy > embedding.npy
 
 ## HTTP Server
 
-Run vectorme as an HTTP server for integration with other applications:
+Run vectorme as an HTTP server with web UI for voice recording and speaker analysis:
 
 ```bash
 vectorme --serve
 # Starting server on 127.0.0.1:3120
+# Open http://localhost:3120 in your browser
 ```
 
 **Options:**
@@ -265,9 +267,9 @@ Real-time NDJSON output:
 ```
 
 **Event fields:**
-- `segment.vad_confidence` - Average VAD speech probability for the segment (0.0-1.0, only when VAD enabled)
-- `speaker_change.vad_confidence` - VAD confidence at the speaker change point (only when VAD enabled)
+- `segment.vad_confidence` - A (NeMo MSDD)
 
+TS-VAD uses NeMo's Multi-Scale Diarization Decoder (MSDD) for advanced batch diarization with precise speaker boundaries and intelligent unknown speaker clustering
 **Additional parameters:**
 - `chunk_size` - Chunk duration in seconds (default: 3.0, matches ECAPA-TDNN training)
 - `chunk_hop` - Hop between chunks (default: 0.5)
@@ -435,3 +437,33 @@ The pretrained `speechbrain/spkrec-ecapa-voxceleb` model was trained on **fixed-
 References:
 - [SpeechBrain ECAPA recipe](https://github.com/speechbrain/speechbrain/blob/develop/recipes/VoxCeleb/SpeakerRec/hparams/train_ecapa_tdnn.yaml)
 - [Model card](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb)
+## Frontend Architecture
+
+The web UI is built with a modular, no-build-step architecture for rapid development:
+
+### File Structure
+- **`static/index.html`** (26 lines) - Minimal HTML shell with CDN imports
+- **`static/styles.css`** (692 lines) - Complete styling with responsive design and SASS-ready structure
+- **`static/app.js`** (1767 lines) - React component with JSX transpiled in-browser via Babel
+
+### Technology Stack
+- **React 18** - Loaded via unpkg CDN, no build step required
+- **WaveSurfer.js 7** - Audio waveform visualization and region selection
+- **Babel Standalone** - Client-side JSX transformation for rapid iteration
+- **MediaRecorder API** - WebM/Opus recording with 1-second chunks for streaming
+- **Fetch Streaming** - NDJSON event stream processing for real-time updates
+
+### Key Features
+- **Zero build complexity**: Edit app.js and refresh - changes appear instantly
+- **Semantic CSS**: All elements use meaningful class names (`.segment-speaker`, `.timeline-info`)
+- **Modular separation**: HTML structure, styling, and logic cleanly separated
+- **ARIA accessibility**: Full screen reader support with proper labeling
+- **Responsive design**: Mobile-optimized with breakpoints at 768px and 480px
+
+### Development Workflow
+1. Edit `static/app.js` for logic changes
+2. Edit `static/styles.css` for styling
+3. Refresh browser - no build required
+4. Changes persist immediately with Flask auto-reload
+
+This architecture enables rapid prototyping while maintaining production-ready code organization.
