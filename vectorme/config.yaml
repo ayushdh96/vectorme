@@ -1,0 +1,33 @@
+# VectorMe Configuration
+# TS-VAD (Timestamp-based Voice Activity Detection) and Speaker Diarization Parameters
+
+# TS-VAD refinement parameters
+ts_vad:
+  # Minimum segment duration in seconds (segments shorter than this are filtered out)
+  min_segment_duration: 0.3
+  
+  # Minimum total audio duration in seconds for a cluster to be considered for speaker identification
+  min_cluster_audio: 1.2
+  
+  # Maximum total audio duration in seconds to concatenate for speaker identification
+  max_concat_audio: 12.0
+  
+  # Cosine similarity threshold for matching speaker embeddings (0.0 to 1.0)
+  # Higher values require closer matches to existing speakers
+  identify_threshold: 0.5
+
+# VAD (Voice Activity Detection) parameters
+vad:
+  # Confidence threshold for VAD predictions (0.0 to 1.0)
+  # Higher values are more conservative about what is considered speech
+  confidence_threshold: 0.5
+
+# Speaker identification and change detection parameters
+speaker:
+  # Cosine similarity threshold for speaker identification (0.0 to 1.0)
+  # Higher values require closer matches to known speakers
+  similarity_threshold: 0.3
+  
+  # Cosine similarity drop threshold for detecting speaker changes (0.0 to 1.0)
+  # When similarity drops below this, a speaker change is detected
+  change_threshold: 0.7

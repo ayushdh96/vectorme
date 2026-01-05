@@ -9,13 +9,14 @@ Watch a video: https://youtu.be/-kvUzvcfD6o
 
 ## Features
 
-- **Speaker Embeddings**: Extract 192-dimensional speaker embeddings using ECAPA-TDNN
-- **Speaker Database**: Store and query known speakers with vector similarity search
-- **Real-time Diarization**: Live streaming speaker detection with confidence scores
-- **TS-VAD Refinement**: NeMo MSDD-based batch diarization with precise speaker boundaries
-- **Web UI**: React-based voice recorder with live waveform visualization and speaker timeline
-- **HTTP Server**: REST API with OpenAI-compatible endpoints and streaming support
-- **Format Support**: WAV, M4A, MP3, AAC, FLAC, OGG, WebM, and more (via ffmpeg)
+- **Speaker Embeddings**: Extract 192-dimensional speaker embeddings
+- **Speaker Database**: Store and query known speakers
+- **Diarization**: Process audio in chunks to identify who is speaking when
+- **NeMo MSDD TS-VAD**: Neural refinement with VAD hard-gating and intelligent segment merging
+- **Configuration**: YAML-based configuration for all diarization parameters
+- **HTTP Server**: REST API with streaming support
+- **Web UI**: React-based voice recorder with Fast/Accurate mode selector
+- **Format Support**: WAV, M4A, MP3, AAC, FLAC, OGG, and more (via ffmpeg)
 - **GPU Acceleration**: CUDA and Metal (MPS) support
 - **CPU Compatibility**: Automatic tensor layout fixes for CPU-based NeMo MSDD processing
 
@@ -180,14 +181,28 @@ vectorme --serve --host 0.0.0.0 --port 8080 --gpu
 
 ### Web UI
 
-The web interface provides:
-- **Real-time recording** with live waveform visualization
-- **Streaming diarization** with instant speaker detection
-- **Interactive audio timeline** showing speaker segments
-- **Drag-to-select** audio regions for focused analysis
-- **Speaker labeling** interface for naming unknown speakers
-- **Saved recordings** library with shareable links
-- **Multi-scale embeddings** with confidence scores
+The HTTP server includes a built-in React-based Web UI accessible at `http://localhost:3120/`.
+
+**Features:**
+- 🎙️ **Voice Recording**: Record audio directly in the browser
+- ⚡ **Fast/Accurate Mode Selector**: Choose between streaming (Fast) or TS-VAD refined (Accurate) diarization
+- 📊 **Real-time Visualization**: Color-coded speaker timeline with WaveSurfer.js
+- 🏷️ **Speaker Management**: Name unknown speakers or reassign segments to existing speakers
+- 💾 **Recording Storage**: Save/load recordings with automatic persistence
+- 📈 **Similarity Scores**: View speaker match confidence and VAD metrics
+- 🎨 **Interactive Timeline**: Click segments to play, hover for details
+
+**Diarization Modes:**
+- **⚡ Fast Mode** (default): Real-time streaming diarization during recording
+- **🎯 Accurate Mode**: NeMo MSDD TS-VAD refinement with VAD hard-gating and segment merging
+
+**Recording Workflow:**
+1. Select **⚡ Fast** or **🎯 Accurate** mode (persisted in localStorage)
+2. Click **Record** to start capturing audio
+3. **Fast mode**: See real-time speaker segments during recording
+4. **Accurate mode**: Processing runs after you stop recording
+5. Click segments in the timeline to play from that point
+6. Click unknown speakers to assign names from the database
 
 ### API Endpoints
 
@@ -264,24 +279,79 @@ TS-VAD uses NeMo's Multi-Scale Diarization Decoder (MSDD) for advanced batch dia
 - `vad=false` - Disable Voice Activity Detection (enabled by default)
 - `vad_threshold` - VAD speech probability threshold (default: 0.5)
 
-### TS-VAD Refined Diarization (NeMo MSDD)
+## Configuration
 
-TS-VAD uses NeMo's NeuralDiarizer with Multi-Scale Diarization Decoder (MSDD) for advanced batch diarization with precise speaker boundaries and intelligent unknown speaker clustering.
+VectorMe uses a YAML configuration file at `vectorme/config.yaml` for all diarization parameters:
 
-**NeMo Integration:**
-- **NeuralDiarizer**: NVIDIA NeMo's end-to-end diarization pipeline
-- **MSDD Model**: Multi-scale temporal modeling with `diar_msdd_telephonic` weights
-- **VAD**: MarbleNet voice activity detection (`vad_marblenet`)
-- **Embeddings**: TitaNet/ECAPA-TDNN speaker embeddings with multi-scale windows
-- **CPU Compatibility**: Automatic tensor layout fixes via `.reshape()` fallback for CPU execution
+```yaml
+# TS-VAD refinement parameters
+ts_vad:
+  min_segment_duration: 0.3    # Filter segments shorter than 300ms
+  min_cluster_audio: 1.2       # Minimum audio needed to identify a speaker
+  max_concat_audio: 12.0       # Maximum audio to use for speaker embedding
+  identify_threshold: 0.5      # Cosine similarity threshold for speaker matching
 
-**Key differences from streaming diarization:**
-- **Batch processing**: Analyzes the entire audio file instead of streaming chunks
-- **Multi-scale embeddings**: 5 temporal scales (0.5s to 1.5s windows) for robust speaker modeling
-- **Unknown speaker clustering**: Groups unidentified segments into `unknown_1`, `unknown_2`, etc. based on voice similarity
-- **Precise timestamps**: MSDD refinement provides more accurate speaker change boundaries
+# VAD (Voice Activity Detection) parameters
+vad:
+  confidence_threshold: 0.5    # Speech probability threshold
 
-**Enable TS-VAD mode:**
+# Speaker identification parameters
+speaker:
+  similarity_threshold: 0.3    # Threshold for matching known speakers
+  change_threshold: 0.7        # Threshold for detecting speaker changes
+```
+
+These values are loaded at module initialization and used by both CLI and HTTP server.
+
+## NeMo MSDD TS-VAD Refinement
+
+VectorMe integrates NVIDIA NeMo's Multi-Scale Diarization Decoder (MSDD) for high-quality speaker diarization refinement with advanced post-processing:
+
+1. **Streaming (Fast Mode)**: Real-time ECAPA-TDNN embeddings during recording
+2. **TS-VAD Refinement (Accurate Mode)**: Neural refinement with VAD hard-gating and segment merging
+
+### How It Works
+
+```mermaid
+graph LR
+    A[Audio Input] --> B[NeMo MSDD]
+    B --> C[RTTM Segments]
+    C --> D[VAD Hard Gate]
+    D --> E[Speaker Clustering]
+    E --> F[Known Speaker Matching]
+    F --> G[Segment Merging]
+    G --> H[Final Output]
+```
+
+**Pipeline Stages:**
+
+1. **NeMo MSDD Diarization**: Multi-scale neural diarization produces RTTM segments with raw speaker labels
+
+2. **VAD Hard Gate** (NEW): Filters silence/noise segments before speaker identification
+   - Extracts waveform slice for each RTTM segment
+   - Runs Silero VAD to compute `speech_ratio` and `avg_confidence`
+   - Drops segments where `speech_ratio < 0.15` OR `avg_confidence < 0.25`
+   - **Result**: Silence/noise segments never reach speaker matching → no `unknown_*` labels for non-speech
+
+3. **Speaker Clustering**: Concatenates audio for each cluster, computes ECAPA-TDNN embeddings
+
+4. **Known Speaker Matching**: Matches cluster embeddings against VectorDB using cosine similarity
+
+5. **Segment Merging** (NEW): Intelligent post-processing to reduce fragmentation
+   - Merges consecutive segments with **same speaker** if gap < 0.5s
+   - Removes short unknown segments (<0.6s) sandwiched between segments with the **same known speaker**
+   - **Result**: `Ayush / (0.3s pause) / Ayush` becomes single `Ayush` segment
+   - **Preserves**: `Ayush / Amber / Ayush` stays as three separate segments
+
+### NeMo Configuration
+
+The NeMo MSDD model configuration is stored in `vectorme/nemo_msdd_configs/diar_infer_telephonic.yaml` and loaded automatically when using TS-VAD refinement. The configuration is optimized for telephonic/conversational audio with overlap detection disabled.
+
+Key parameters are controlled via `vectorme/config.yaml` (see Configuration section above).
+
+### API Usage
+
+**Request TS-VAD refinement via API:**
 ```bash
 curl -X POST http://localhost:3120/v1/audio/transcriptions \
   -F "file=@conversation.m4a" \
@@ -289,54 +359,62 @@ curl -X POST http://localhost:3120/v1/audio/transcriptions \
   -F "diarization_mode=ts_vad"
 ```
 
-**TS-VAD-specific parameters:**
-- `diarization_mode=ts_vad` - Enable TS-VAD refinement (default: `streaming`)
-- `window_size` - Analysis window duration in seconds (default: 2.0)
-- `window_hop` - Hop between windows in seconds (default: 0.5)
-- `unknown_assign_threshold` - Similarity threshold for grouping unknown speakers (default: 0.60)
-- `min_segment_duration` - Minimum segment length in seconds (default: 0.5)
-
-**TS-VAD Response:**
+**Response includes:**
 ```json
 {
   "mode": "ts_vad",
-  "duration": 59.07,
+  "duration": 30.5,
   "segments": [
-    {"start": 0.0, "end": 3.2, "speaker": "Ayush", "similarity": 0.78, "vad_confidence": 0.91},
-    {"start": 3.2, "end": 7.5, "speaker": "unknown_1", "similarity": 0.42, "vad_confidence": 0.85},
-    {"start": 7.5, "end": 12.1, "speaker": "Doug", "similarity": 0.82, "vad_confidence": 0.89}
+    {
+      "start": 0.0,
+      "end": 5.2,
+      "speaker": "Doug",
+      "similarity": 0.85,
+      "cause": "ts_vad",
+      "confidence": null
+    },
+    {
+      "start": 5.2,
+      "end": 12.8,
+      "speaker": "unknown_1",
+      "similarity": 0.72,
+      "cause": "ts_vad",
+      "confidence": null
+    }
   ],
-  "known_speakers": ["Ayush", "Doug"],
+  "known_speakers": ["Doug"],
   "unknown_speakers": ["unknown_1"],
-  "total_segments": 3
+  "backend": "nemo_msdd"
 }
 ```
 
-**Unknown speaker handling:**
-- Segments with similarity below `threshold` (0.5) are marked as unknown
-- Unknown segments are clustered by voice similarity
-- Each cluster gets a unique ID: `unknown_1`, `unknown_2`, etc.
-- Similar-sounding unknowns are grouped together (controlled by `unknown_assign_threshold`)
+### Web UI Integration
 
-**Web UI features:**
-- Real-time speaker detection during recording with live waveform visualization
-- Confidence scores for each speaker identification
-- Color-coded similarity indicators (green ≥70%, yellow 50-69%, red <50%)
-- Speaker labeling interface for unknown speakers
-- Drag-to-select audio regions for focused analysis
+The Web UI provides two diarization modes:
 
-**CLI example with all parameters:**
+- **⚡ Fast Mode**: Streaming diarization with real-time speaker detection during recording
+- **🎯 Accurate Mode**: NeMo MSDD TS-VAD refinement runs after recording stops
+
+Mode selection is persisted in browser localStorage. In Accurate mode:
+1. Recording proceeds normally without real-time diarization
+2. When you click **Stop**, the full audio is processed through NeMo MSDD pipeline
+3. VAD hard-gating removes silence/noise segments
+4. Speaker clustering and matching produces labeled segments
+5. Segment merging reduces fragmentation from small gaps
+6. Results replace any streaming segments
+
+### Requirements
+
+TS-VAD refinement requires additional dependencies:
+
 ```bash
-curl -X POST http://localhost:3120/v1/audio/transcriptions \
-  -F "file=@meeting.m4a" \
-  -F "response_format=diarized_json" \
-  -F "diarization_mode=ts_vad" \
-  -F "window_size=2.0" \
-  -F "window_hop=0.5" \
-  -F "unknown_assign_threshold=0.60" \
-  -F "vad=true" \
-  -F "threshold=0.5"
+pip install nemo_toolkit[asr]
 ```
+
+The NeMo models are downloaded automatically on first use:
+- `vad_marblenet` - Voice Activity Detection
+- `ecapa_tdnn` - Speaker embeddings (NeMo variant)
+- `diar_msdd_telephonic` - Multi-Scale Diarization Decoder
 
 ## About ECAPA-TDNN
 
