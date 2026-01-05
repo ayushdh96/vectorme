@@ -16,8 +16,11 @@ build/
 # Model cache (downloaded separately)
 ~/.cache/
 
-# Virtual environments
+#virtual environments
 venv/
-.venv/
 env/
+.venv/
 .env/
+
+# Logs
+*.log
