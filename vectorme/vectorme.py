@@ -34,6 +34,154 @@ DEFAULT_DB_PATH = Path.home() / ".vectorme" / "speakers.npz"
 # Default recordings directory
 DEFAULT_RECORDINGS_PATH = Path.home() / ".vectorme" / "recordings"
 
+# Default LR model location (trained on stored embeddings)
+DEFAULT_LR_MODEL_PATH = Path.home() / ".vectorme" / "speaker_lr.npz"
+
+
+def _softmax(x: np.ndarray) -> np.ndarray:
+    x = np.array(x, dtype=np.float32)
+    x = x - np.max(x)
+    ex = np.exp(x)
+    s = np.sum(ex)
+    return ex / s if s > 0 else ex
+
+
+class SpeakerLRModel:
+    """
+    Lightweight multinomial logistic regression on top of ECAPA embeddings.
+    Pure NumPy implementation (no sklearn dependency).
+    """
+
+    def __init__(self, classes=None, W=None, b=None):
+        self.classes = classes or []
+        self.W = W
+        self.b = b
+
+    @property
+    def is_trained(self) -> bool:
+        return self.W is not None and self.b is not None and len(self.classes) > 0
+
+    def save(self, path: Path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(path, classes=np.array(self.classes, dtype=object), W=self.W, b=self.b)
+
+    @classmethod
+    def load(cls, path: Path) -> "SpeakerLRModel":
+        path = Path(path)
+        if not path.exists():
+            return cls()
+        data = np.load(path, allow_pickle=True)
+        return cls(
+            classes=data["classes"].tolist(),
+            W=data["W"].astype(np.float32),
+            b=data["b"].astype(np.float32),
+        )
+
+    @staticmethod
+    def _l2_normalize_rows(X: np.ndarray) -> np.ndarray:
+        X = np.array(X, dtype=np.float32)
+        n = np.linalg.norm(X, axis=1, keepdims=True)
+        n = np.where(n == 0, 1.0, n)
+        return X / n
+
+    @staticmethod
+    def _l2_normalize_vec(x: np.ndarray) -> np.ndarray:
+        x = np.array(x, dtype=np.float32).flatten()
+        n = np.linalg.norm(x)
+        return x / n if n > 0 else x
+
+    def train_from_db(
+        self,
+        db: "VectorDB",
+        min_samples_per_class: int = 5,
+        lr: float = 0.5,
+        epochs: int = 400,
+        reg: float = 1e-4,
+        seed: int = 1337,
+    ) -> Dict[str, Any]:
+        if db.embeddings is None or len(db.names) == 0:
+            raise ValueError("VectorDB is empty; add speakers before training.")
+
+        counts = db.count_by_name()
+        eligible = sorted([n for n, c in counts.items() if c >= min_samples_per_class])
+        if len(eligible) < 2:
+            raise ValueError(
+                f"Need at least 2 speakers with ≥{min_samples_per_class} samples each. Eligible: {eligible}"
+            )
+
+        X_list, y_list = [], []
+        for i, name in enumerate(db.names):
+            if name not in eligible:
+                continue
+            X_list.append(db.embeddings[i])
+            y_list.append(eligible.index(name))
+
+        X = np.vstack(X_list).astype(np.float32)
+        y = np.array(y_list, dtype=np.int64)
+
+        # Normalize like cosine world
+        X = self._l2_normalize_rows(X)
+
+        N, D = X.shape
+        K = len(eligible)
+
+        rng = np.random.default_rng(seed)
+        W = (0.01 * rng.standard_normal((K, D))).astype(np.float32)
+        b = np.zeros((K,), dtype=np.float32)
+
+        # one-hot
+        Y = np.zeros((N, K), dtype=np.float32)
+        Y[np.arange(N), y] = 1.0
+
+        for _ in range(int(epochs)):
+            logits = (X @ W.T) + b
+            logits = logits - np.max(logits, axis=1, keepdims=True)
+            exp = np.exp(logits)
+            P = exp / np.sum(exp, axis=1, keepdims=True)
+
+            dZ = (P - Y) / float(N)
+            dW = dZ.T @ X + reg * W
+            dbias = np.sum(dZ, axis=0)
+
+            W -= lr * dW
+            b -= lr * dbias
+
+        self.classes = eligible
+        self.W = W.astype(np.float32)
+        self.b = b.astype(np.float32)
+
+        # quick sanity train accuracy
+        logits = (X @ self.W.T) + self.b
+        preds = np.argmax(logits, axis=1)
+        acc = float(np.mean(preds == y))
+
+        return {
+            "num_samples": int(N),
+            "num_classes": int(K),
+            "classes": eligible,
+            "train_accuracy": round(acc, 4),
+        }
+
+    def predict(self, embedding: np.ndarray) -> Dict[str, Any]:
+        if not self.is_trained:
+            return {"name": None, "top_prob": 0.0, "margin": 0.0, "probs": {}}
+
+        x = self._l2_normalize_vec(embedding)
+        logits = (self.W @ x) + self.b
+        probs = _softmax(logits)
+
+        order = np.argsort(probs)[::-1]
+        top_i = int(order[0])
+        top2_i = int(order[1]) if len(order) > 1 else top_i
+
+        top_prob = float(probs[top_i])
+        top2_prob = float(probs[top2_i]) if len(order) > 1 else 0.0
+        margin = float(top_prob - top2_prob)
+
+        probs_dict = {self.classes[i]: float(probs[i]) for i in range(len(self.classes))}
+        return {"name": self.classes[top_i], "top_prob": top_prob, "margin": margin, "probs": probs_dict}
+
 
 def load_config() -> dict:
     """Load configuration from config.yaml. Raises FileNotFoundError if missing."""
@@ -773,19 +921,47 @@ def _match_cluster_to_known(
     cluster_wave,
     db: 'VectorDB',
     identify_threshold: float,
+    lr_model: Optional[SpeakerLRModel] = None,
+    prob_threshold: float = 0.70,
+    margin_threshold: float = 0.05,
 ) -> Tuple[Optional[str], float]:
-    """Compute ECAPA embedding for cluster audio and match to VectorDB."""
+    """Match cluster embedding to known speakers.
+
+    If LR model is available: return (name, top_prob) when confident.
+    Otherwise fall back to cosine DB query and return (name, cosine_sim).
+    """
     with torch.no_grad():
         emb = classifier.encode_batch(cluster_wave)
         emb = _normalize_vec(emb.squeeze().cpu().numpy())
 
+    # 1) LR model (preferred)
+    if lr_model is not None and getattr(lr_model, "is_trained", False):
+        pred = lr_model.predict(emb)
+        name = pred.get("name")
+        top_prob = float(pred.get("top_prob", 0.0) or 0.0)
+        margin = float(pred.get("margin", 0.0) or 0.0)
+
+        if name and top_prob >= float(prob_threshold) and margin >= float(margin_threshold):
+            return name, top_prob
+
+        # Not confident enough from LR; fall through to cosine as a backstop.
+        # This prevents strong cosine matches (e.g., known speakers) from being labeled as unknown
+        # just because LR thresholds are strict or the class is missing/weak.
+        lr_score = top_prob
+
+    # 2) Cosine fallback
     if len(db) == 0:
-        return None, 0.0
+        # If LR was attempted but not confident, return LR score so callers can log it.
+        return None, float(locals().get("lr_score", 0.0))
 
     res = db.query(emb, top_k=1)
     if res and res[0]["similarity"] >= identify_threshold:
         return res[0]["name"], float(res[0]["similarity"])
-    return None, float(res[0]["similarity"]) if res else 0.0
+
+    # No confident cosine match either.
+    # Return the best available score (cosine if present, else LR top_prob) for debugging/telemetry.
+    cosine_score = float(res[0]["similarity"]) if res else 0.0
+    return None, max(cosine_score, float(locals().get("lr_score", 0.0)))
 
 
 from contextlib import contextmanager
@@ -824,6 +1000,9 @@ def nemo_ts_vad_refine(
     min_segment_duration: float = None,
     min_cluster_audio_seconds: float = None,
     device: str = "cpu",
+    lr_model: Optional[SpeakerLRModel] = None,
+    prob_threshold: Optional[float] = None,
+    margin_threshold: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run NeMo MSDD diarization (TS-VAD-style refinement) and then map diarized speakers to known names.
 
@@ -841,6 +1020,12 @@ def nemo_ts_vad_refine(
         min_segment_duration = CONFIG['ts_vad']['min_segment_duration']
     if min_cluster_audio_seconds is None:
         min_cluster_audio_seconds = CONFIG['ts_vad']['min_cluster_audio']
+
+    # LR identification thresholds (optional)
+    if prob_threshold is None:
+        prob_threshold = float(CONFIG.get('ts_vad', {}).get('lr_prob_threshold', 0.70))
+    if margin_threshold is None:
+        margin_threshold = float(CONFIG.get('ts_vad', {}).get('lr_margin_threshold', 0.05))
     
     from omegaconf import OmegaConf
 
@@ -951,6 +1136,9 @@ def nemo_ts_vad_refine(
                 cluster_wave=cluster_wave,
                 db=db,
                 identify_threshold=float(identify_threshold),
+                lr_model=lr_model,
+                prob_threshold=prob_threshold,
+                margin_threshold=margin_threshold,
             )
             if name is not None:
                 speaker_map[rs] = {"label": name, "similarity": float(sim)}
@@ -1078,6 +1266,18 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
     # Initialize database
     db = VectorDB(db_path)
     print(f"Loaded {len(db)} speakers from database", file=sys.stderr)
+    
+    # Load LR speaker classifier if available (optional)
+    try:
+        lr_model = SpeakerLRModel.load(DEFAULT_LR_MODEL_PATH)
+        if not lr_model.is_trained:
+            lr_model = None
+        else:
+            print(f"Loaded LR model with {len(lr_model.classes)} classes", file=sys.stderr)
+            print(f"[LR] classes: {lr_model.classes}", file=sys.stderr)
+    except Exception as e:
+        print(f"Warning: failed to load LR model: {e}", file=sys.stderr)
+        lr_model = None
     
     # VAD will be loaded on first use if requested
     vad_instance = None
@@ -1501,6 +1701,7 @@ def run_server(host, port, db_path, device="cpu", recordings_path=None):
                                 identify_threshold=identify_threshold,
                                 min_segment_duration=min_segment_duration,
                                 device=device,
+                                lr_model=lr_model,
                             )
                             return jsonify(result)
                         except ImportError as ie:
@@ -2095,6 +2296,17 @@ def main():
     parser = argparse.ArgumentParser(
         description="Extract speaker embedding vector using ECAPA-TDNN"
     )
+    # ---- LR speaker model training (optional) ----
+    parser.add_argument("--train-lr", action="store_true",
+                        help="Train LR speaker model from current VectorDB embeddings")
+    parser.add_argument("--lr-model-path", type=str, default=str(DEFAULT_LR_MODEL_PATH),
+                        help="Path to save LR speaker model (.npz)")
+    parser.add_argument("--lr-min-samples", type=int, default=5,
+                        help="Minimum embeddings per speaker to include in LR training")
+    parser.add_argument("--lr-epochs", type=int, default=400,
+                        help="Training epochs for LR model")
+    parser.add_argument("--lr-step", type=float, default=0.5,
+                        help="Learning rate (step size) for LR training")
     parser.add_argument(
         "--file", "-f",
         type=str,
@@ -2205,6 +2417,31 @@ def main():
         help="Server port (default: 3120)"
     )
     args = parser.parse_args()
+    # ---- Train LR model and exit ----
+    if getattr(args, "train_lr", False):
+        # Reuse whichever DB flag already exists in this CLI
+        # (supports --db-path, --db, etc. without forcing a rename)
+        db_path_arg = (
+            getattr(args, "db_path", None)
+            or getattr(args, "db", None)
+            or getattr(args, "dbfile", None)
+            or None
+        )
+
+        db = VectorDB(db_path_arg)
+        model_path = Path(getattr(args, "lr_model_path"))
+
+        lr_model = SpeakerLRModel()
+        summary = lr_model.train_from_db(
+            db,
+            min_samples_per_class=int(getattr(args, "lr_min_samples", 5)),
+            lr=float(getattr(args, "lr_step", 0.5)),
+            epochs=int(getattr(args, "lr_epochs", 400)),
+        )
+        lr_model.save(model_path)
+
+        print(json.dumps({"message": "trained_lr_model", "model_path": str(model_path), **summary}, indent=2))
+        sys.exit(0)
 
     # Handle --serve mode first (before loading model)
     if args.serve:
